@@ -294,7 +294,7 @@ class StreamService:
         headers = {
             "Content-Type": content_type,
             "Content-Encoding": "identity",
-            "Accept-Ranges": "bytes",
+            "Accept-Ranges": "none",
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -380,7 +380,7 @@ class StreamService:
                     quality_headers["X-Audio-Bit-Depth"] = str(flac.bit_depth)
                 if flac.sample_rate:
                     quality_headers["X-Audio-Sample-Rate"] = str(flac.sample_rate)
-                if flac.is_dash:
+                if flac.is_dash or (time_offset and time_offset > 0):
                     return await self._proxy_ffmpeg(
                         flac.url, flac.content_type, quality_headers, time_offset=time_offset
                     )

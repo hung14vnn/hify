@@ -1,4 +1,4 @@
-import { getKaraoke, getPlayQueue, getSession, releaseKaraoke, savePlayQueue, scrobble, streamUrl } from './api';
+import { getAlbum, getKaraoke, getPlayQueue, getSession, releaseKaraoke, savePlayQueue, scrobble, streamUrl } from './api';
 import { build, buildLabel } from './build';
 import { isPlaybackLogEnabled, logPlayback } from './playback/debugLog';
 import { audioSettings } from './playback/audioSettings.svelte';
@@ -496,7 +496,7 @@ class Player {
 		});
 		a.addEventListener('loadedmetadata', () => {
 			if (this.audio !== a) return;
-			if (this.pendingSeek) {
+			if (this.pendingSeek && !this.streamOffset) {
 				a.currentTime = this.pendingSeek;
 				this.pendingSeek = 0;
 			}
@@ -683,10 +683,9 @@ class Player {
 		this.cancelPreroll();
 		this.setTime(seconds);
 		const a = this.audio;
-		const isFiniteDuration = Number.isFinite(a.duration) && a.duration > 0;
 		const isOfflineOrBlob = this.playingOffline || (a.src && a.src.startsWith('blob:'));
 
-		if (isOfflineOrBlob || isFiniteDuration) {
+		if (isOfflineOrBlob) {
 			if (a.src) {
 				try {
 					a.currentTime = seconds;
@@ -696,15 +695,35 @@ class Player {
 			} else {
 				this.pendingSeek = seconds;
 			}
-		} else if (this.current) {
-			// Stream has unknown/infinite duration (e.g. live remuxed pipe):
-			// Seek by requesting the stream from the server with timeOffset!
+			this.updatePosition();
+			return;
+		}
+
+		// A lossless or piped stream cannot be byte-seeked by the browser; seek via server timeOffset.
+		const isLosslessStream =
+			this.streamOffset > 0 ||
+			(this.current && (isLossless(this.current) || this.current.suffix === 'flac' || this.current.id.startsWith('st-'))) ||
+			!Number.isFinite(a.duration) ||
+			a.duration <= 0;
+
+		if (isLosslessStream && this.current) {
 			this.streamOffset = seconds;
+			this.pendingSeek = 0;
 			const src = streamUrl(this.current.id, ++this.streamBust, seconds);
 			logPlayback('stream-seek', `id=${this.current.id} at=${seconds.toFixed(1)}`);
 			a.src = src;
 			a.load();
 			this.play();
+		} else {
+			if (a.src) {
+				try {
+					a.currentTime = seconds;
+				} catch (e) {
+					logPlayback('seek-error', String(e));
+				}
+			} else {
+				this.pendingSeek = seconds;
+			}
 		}
 		this.updatePosition();
 	}
@@ -974,6 +993,17 @@ class Player {
 		setMediaMetadata(song);
 		setMediaPosition(this.duration, startAt, this.audio.playbackRate);
 
+		if (!song.coverArt && song.albumId) {
+			void getAlbum(song.albumId).then((album) => {
+				if (album?.coverArt && this.queue[this.index]?.id === song.id) {
+					this.queue[this.index] = { ...this.queue[this.index], coverArt: album.coverArt };
+					if (this.current?.id === song.id) {
+						setMediaMetadata(this.current);
+					}
+				}
+			}).catch(() => {});
+		}
+
 		let offline: OfflineCopy | null = null;
 		if (this.playingOffline?.id === song.id) {
 			// Restarting the same track: keep its URL.
@@ -998,8 +1028,9 @@ class Player {
 		}
 		const outgoing = this.playingOffline;
 		this.playingOffline = offline;
-		this.streamOffset = 0;
-		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0);
+		const isLosslessStream = !offline && (isLossless(song) || song.suffix === 'flac' || song.id.startsWith('st-'));
+		this.streamOffset = startAt > 0 && isLosslessStream ? startAt : 0;
+		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0, this.streamOffset);
 		const handoff = autoplay && startAt === 0 && this.standbyHolds(src);
 
 		logPlayback(
@@ -1018,7 +1049,7 @@ class Player {
 			this.applyVolume(this.audio);
 			this.audio.src = src;
 			this.audio.load();
-			if (startAt > 0) this.audio.currentTime = startAt;
+			if (startAt > 0 && !isLosslessStream) this.audio.currentTime = startAt;
 		}
 		this.output?.trackChanged(isLossless(song));
 		this.applyReplayGain();
@@ -1628,6 +1659,10 @@ class Player {
 		const d = this.audio.duration;
 		if (!Number.isFinite(d) || d <= 0) return;
 		const reported = this.current?.duration ?? 0;
+		if (this.streamOffset > 0 && reported > 0) {
+			this.duration = reported;
+			return;
+		}
 		if (reported > 0 && d > reported * DURATION_MISMATCH_RATIO) {
 			this.duration = reported;
 			this.durationCap = reported;
@@ -1799,7 +1834,14 @@ class Player {
 	private onEnded() {
 		if (this.repeat === 'one') {
 			this.scrobbled = false;
-			this.audio.currentTime = 0;
+			this.streamOffset = 0;
+			if (this.current && (isLossless(this.current) || this.current.suffix === 'flac' || this.current.id.startsWith('st-'))) {
+				const src = streamUrl(this.current.id, ++this.streamBust, 0);
+				this.audio.src = src;
+				this.audio.load();
+			} else {
+				this.audio.currentTime = 0;
+			}
 			this.play();
 			return;
 		}

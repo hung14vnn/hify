@@ -118,6 +118,8 @@
 					tint
 				};
 			}
+		} else if (currentDisplay.id === cur.id && !currentDisplay.coverArt && cur.coverArt) {
+			currentDisplay.coverArt = cur.coverArt;
 		}
 	});
 
@@ -1162,7 +1164,7 @@
 				bind:this={mainEl}
 			>
 				<div class="art-row" class:mini={mobileOpen}>
-					<div class="art-wrap" class:has-art={!!currentDisplay?.coverArt} data-flip="art">
+					<div class="art-wrap" data-flip="art">
 						<div class="art" class:paused={!player.playing}>
 							<div class="art-layers">
 								{#if currentDisplay}
@@ -2456,7 +2458,7 @@
 		.art-row:not(.mini) {
 			padding-top: 0;
 		}
-		.art-row:not(.mini) .art-wrap.has-art {
+		.art-row:not(.mini) .art-wrap {
 			opacity: 0;
 			pointer-events: none;
 		}

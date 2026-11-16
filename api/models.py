@@ -54,6 +54,8 @@ def song_from_spotify(track: dict[str, Any], *, album: dict[str, Any] | None = N
         "year": _year(album_dict.get("release_date")),
         "coverArt": _image(album_dict.get("images")),
         "duration": int(round(duration_ms / 1000)) if duration_ms else None,
+        "suffix": "flac",
+        "contentType": "audio/flac",
         "type": "music",
         "isDir": False,
         "isrc": [isrc] if isrc else None,

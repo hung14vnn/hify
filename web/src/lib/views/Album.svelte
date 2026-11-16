@@ -28,6 +28,13 @@
 	}
 
 	function assemble(album: Album) {
+		if (album.coverArt && album.song) {
+			for (const s of album.song) {
+				if (!s.coverArt) s.coverArt = album.coverArt;
+				if (!s.album) s.album = album.name;
+				if (!s.albumId) s.albumId = album.id;
+			}
+		}
 		const others = (a: Awaited<ReturnType<typeof getArtist>>) => (a.album ?? []).filter((x) => x.id !== album.id);
 		const artist = album.artistId ? cachedNow(`artist:${album.artistId}`, () => getArtist(album.artistId!)) : null;
 		// Synchronous when the artist is cached, so the shelf is there in the first frame.
