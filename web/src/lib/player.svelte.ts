@@ -1601,6 +1601,10 @@ class Player {
 	private onTime() {
 		const a = this.audio;
 		if (a.seeking) return;
+		if (this.streamOffset > 0 && a.currentTime >= this.streamOffset - 3) {
+			// The stream already preserved the timestamp (e.g. ffmpeg DASH copy)
+			this.streamOffset = 0;
+		}
 		this.time = this.streamOffset + a.currentTime;
 		if (!document.hidden) this.currentTime = this.time;
 		const song = this.current;
