@@ -25,6 +25,8 @@ function buildInfo() {
 
 export default defineConfig({
 	plugins: [sveltekit()],
+	// PUBLIC_API_BASE lets a separately-hosted frontend point at the VM's API.
+	envPrefix: ['PUBLIC_', 'VITE_'],
 	define: {
 		__BUILD__: JSON.stringify(buildInfo())
 	},

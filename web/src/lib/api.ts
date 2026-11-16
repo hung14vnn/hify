@@ -27,6 +27,14 @@ export class SubsonicError extends Error {
 	}
 }
 
+/** The hify API origin: PUBLIC_API_BASE at build time, else the page's own origin. */
+export function apiOrigin(): string {
+	const env = import.meta.env as Record<string, string | undefined>;
+	const configured = (env.PUBLIC_API_BASE ?? '').trim();
+	const fallback = typeof location !== 'undefined' ? location.origin : '';
+	return (configured || fallback).replace(/\/+$/, '');
+}
+
 let session: Session | null = load();
 
 function load(): Session | null {

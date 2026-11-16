@@ -24,7 +24,8 @@ pnpm dev            # http://127.0.0.1:5180
 ```
 
 Production: `cd web && pnpm build`; the backend serves `web/dist` at `/` on the same
-port, so login and `/rest` share an origin.
+port, so login and `/rest` share an origin. If the frontend is hosted separately, build
+it with `PUBLIC_API_BASE=https://api.example.com` and allow that origin in the backend CORS.
 
 ## Configuration
 

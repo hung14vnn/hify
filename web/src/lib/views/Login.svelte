@@ -1,10 +1,9 @@
 <script lang="ts">
-	import { login, SubsonicError } from '../api';
+	import { apiOrigin, login, SubsonicError } from '../api';
 	import Icon from '../components/Icon.svelte';
 
 	let { onlogin }: { onlogin: () => void } = $props();
 
-	let server = $state('http://127.0.0.1:8089');
 	let username = $state('');
 	let password = $state('');
 	let apiKey = $state('');
@@ -23,6 +22,7 @@
 		busy = true;
 		error = '';
 		try {
+			const server = apiOrigin();
 			await login(mode === 'apiKey' ? { server, apiKey } : { server, username, password });
 			onlogin();
 		} catch (err) {
@@ -38,12 +38,6 @@
 	<form class="card" onsubmit={submit}>
 		<div class="logo"><Icon name="note" size={36} /></div>
 		<h1>Sign in to hify</h1>
-		<p class="muted">Use your GroupCalendar account.</p>
-
-		<label>
-			<span>Server</span>
-			<input type="url" bind:value={server} placeholder="http://127.0.0.1:8089" required autocomplete="url" />
-		</label>
 
 		<div class="seg" role="tablist">
 			<button type="button" role="tab" aria-selected={mode === 'password'} class:on={mode === 'password'} onclick={() => (mode = 'password')}>Account</button>
@@ -111,11 +105,6 @@
 		text-align: center;
 		font-size: 24px;
 		letter-spacing: -0.02em;
-	}
-	.card > p.muted {
-		margin: -6px 0 4px;
-		text-align: center;
-		font-size: 14px;
 	}
 	label {
 		display: flex;
