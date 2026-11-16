@@ -1,0 +1,40 @@
+services:
+  api:
+    build: .
+    image: hify-api:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8090"
+    env_file:
+      - .env
+    environment:
+      MUSIC_DB_PATH: /app/data/music.db
+      NETFLIX_DB_PATH: /netflix/db.json
+    volumes:
+      - ./data:/app/data
+      - ./legacy:/legacy
+      - /var/lib/docker/volumes/netflix-clone_app-data/_data/db.json:/netflix/db.json:ro
+    depends_on:
+      - ytproxy
+    networks:
+      - default
+      - music
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Shares the existing ProtonVPN namespace so YouTube does not see the VM IP.
+  ytproxy:
+    image: python:3.12-slim
+    network_mode: "container:addonify-vpn"
+    restart: unless-stopped
+    volumes:
+      - ./deploy/ytproxy.py:/ytproxy.py:ro
+    command: ["python", "/ytproxy.py"]
+
+networks:
+  music:
+    external: true
+

@@ -5,7 +5,7 @@ import time
 
 import httpx
 
-BASE = "http://127.0.0.1:8089"
+BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8089"
 RANGES = ["bytes=0-1", "bytes=0-", "bytes=0-1023", "bytes=1024-2047"]
 
 

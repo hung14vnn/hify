@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(settings.http_timeout_s, read=None),
         follow_redirects=False,
         trust_env=False,
+        proxy=settings.outbound_proxy or None,
         headers={"User-Agent": "hify/1.0"},
     )
     spotify = SpotApiClient()
@@ -46,11 +47,12 @@ async def lifespan(app: FastAPI):
         "lastfm": LastfmService(http),
     }
     logger.info(
-        "ready: db=%s netflix_db=%s flac_addons=%d lastfm=%s",
+        "ready: db=%s netflix_db=%s flac_addons=%d lastfm=%s proxy=%s",
         settings.music_db_path,
         settings.netflix_db_path,
         len(settings.eclipse_addons),
         "on" if settings.lastfm_api_key else "off",
+        "on" if settings.outbound_proxy else "off",
     )
     try:
         yield
@@ -190,6 +192,12 @@ async def set_quality(request: Request, user=Depends(auth.current_user_http)) ->
         raise HTTPException(status_code=400, detail="Unknown quality")
     saved = await db.set_quality(user["user_id"], value)
     return JSONResponse({"quality": saved, "options": list(db.QUALITY_VALUES)})
+
+
+@app.get("/api/v1/downloads")
+async def downloads(user=Depends(auth.current_user_http)) -> JSONResponse:
+    """Downloaded-library metadata imported from the old hify database."""
+    return JSONResponse({"downloads": await db.legacy_downloads(user["user_id"])})
 
 
 # --- static player ----------------------------------------------------------

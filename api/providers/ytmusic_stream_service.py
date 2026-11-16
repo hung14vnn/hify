@@ -27,6 +27,8 @@ import httpx
 from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
 
+from config import settings
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -90,6 +92,8 @@ _YDL_BASE_OPTIONS: dict[str, object] = {
     # The production image already includes Node for YouTube's JS challenges.
     "js_runtimes": {"node": {}},
 }
+if settings.outbound_proxy:
+    _YDL_BASE_OPTIONS["proxy"] = settings.outbound_proxy
 _YDL_FLAT_OPTIONS: dict[str, object] = {**_YDL_BASE_OPTIONS, "extract_flat": True}
 _YDL_OPUS_OPTIONS: dict[str, object] = {
     **_YDL_BASE_OPTIONS,
@@ -131,6 +135,7 @@ class StreamInfo:
     http_headers: dict[str, str] = field(default_factory=dict)
     source_title: str = ""  # what YouTube calls the video
     source_artist: str = ""  # YouTube uploader / channel
+    size_bytes: int | None = None
 
     def with_metadata(self, title: str | None, artist: str | None) -> StreamInfo:
         """Return a copy whose title/artist are overridden when given."""
@@ -222,6 +227,10 @@ class _YtDlp:
                 return None
         source_title = str(info.get("title") or "Unknown")
         source_artist = str(info.get("uploader") or info.get("channel") or "Unknown")
+        try:
+            size_bytes = int(info.get("filesize") or info.get("filesize_approx") or 0) or None
+        except (TypeError, ValueError):
+            size_bytes = None
         return StreamInfo(
             video_id=video_id,
             title=source_title,
@@ -233,6 +242,7 @@ class _YtDlp:
             http_headers=dict(info.get("http_headers") or {}),
             source_title=source_title,
             source_artist=source_artist,
+            size_bytes=size_bytes,
         )
 
     @staticmethod

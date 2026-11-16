@@ -23,9 +23,10 @@ pnpm install
 pnpm dev            # http://127.0.0.1:5180
 ```
 
-Production: `cd web && pnpm build`; the backend serves `web/dist` at `/` on the same
-port, so login and `/rest` share an origin. If the frontend is hosted separately, build
-it with `PUBLIC_API_BASE=https://api.example.com` and allow that origin in the backend CORS.
+Production: `cd web && pnpm build`. The committed `web/.env.production` points the
+player at `https://music.hungtp.ninja/hify-api`; override it with
+`PUBLIC_API_BASE=https://api.example.com pnpm build` when hosting elsewhere.
+The backend can also serve `web/dist` at `/` on the same origin as `/rest`.
 
 ## Configuration
 
@@ -40,14 +41,35 @@ Copy `.env.example` to `.env` in the repo root.
   <https://www.last.fm/api/account/create>. The callback URL registered there must
   match `LASTFM_CALLBACK_URL` (default `http://127.0.0.1:8089/api/v1/lastfm/callback`).
   Each user links their own account from Profile → Last.fm → Connect.
+- `OUTBOUND_PROXY` — optional HTTP CONNECT proxy for YouTube. On a datacenter IP the
+  API can point this at a proxy running inside a VPN namespace so yt-dlp and the
+  audio proxy both leave from the VPN address.
 
 ## Accounts and data
 
 - Sessions live in `data/music.db`; the netflix-clone database is never written.
 - Every row is keyed by the `usr_…` id from that database, so a future move to JWT
   or SSO only replaces `api/auth.py`.
+- Accounts imported from the old hify database live in `legacy_users` and verify
+  their original bcrypt hashes, so the old username/password keeps working.
 - Library = saved artists, liked songs, playlists and play history. Audio is always
   resolved at play time.
+
+## Migrating the old hify library
+
+`api/scripts/migrate_hify.py` imports users, playlists and downloaded-library
+metadata from the old `cache/library.db`. Local tracks are resolved to Spotify or
+YouTube Music ids; a per-user `Downloaded (old hify)` playlist holds the shared
+library, and the `legacy_downloads` table keeps file paths and quality data.
+
+```bash
+cd api
+python scripts/migrate_hify.py --old-db ../legacy/library.db --dry-run
+python scripts/migrate_hify.py --old-db ../legacy/library.db
+```
+
+The script snapshots the old database, caches resolution results and writes a JSON
+report with unmatched tracks. Re-running replaces the imported playlists.
 
 ## App endpoints (Subsonic subset the player uses)
 

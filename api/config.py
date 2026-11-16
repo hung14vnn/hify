@@ -63,6 +63,9 @@ class Settings:
     cors_origins: tuple[str, ...] = _csv("CORS_ORIGINS") or ("*",)
     yt_country: str = _env("YT_COUNTRY", "VN")
     yt_format: str = _env("YT_FORMAT", "opus")
+    # HTTP CONNECT proxy for YouTube traffic, usually a container sharing the
+    # ProtonVPN namespace (YouTube blocks the VM's direct datacenter IP).
+    outbound_proxy: str = _env("OUTBOUND_PROXY")
     http_timeout_s: float = _env_float("HTTP_TIMEOUT_S", 20.0)
 
 

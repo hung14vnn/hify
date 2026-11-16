@@ -6,6 +6,9 @@ This service reads that file read-only, verifies credentials locally and
 issues its own bearer sessions. The netflix user id (``usr_...``) is the
 stable key used by every table here, so migrating to a real token later
 only replaces this module.
+
+Accounts migrated from the old hify database live in ``legacy_users`` and
+keep their bcrypt hashes; both sources are accepted at login.
 """
 
 from __future__ import annotations
@@ -25,6 +28,11 @@ from fastapi import Request
 import db
 from config import settings
 from errors import SubsonicError
+
+try:  # legacy hify accounts use bcrypt; keep netflix-only deployments working
+    import bcrypt
+except ImportError:  # pragma: no cover - dependency is declared in requirements
+    bcrypt = None  # type: ignore[assignment]
 
 _lock = threading.Lock()
 _cache: dict[str, Any] = {"mtime": 0.0, "users": {}, "by_id": {}}
@@ -55,6 +63,15 @@ def verify_scrypt(password: str, encoded: str) -> bool:
     except (ValueError, TypeError):
         return False
     return hmac.compare_digest(derived, expected)
+
+
+def verify_bcrypt(password: str, encoded: str) -> bool:
+    if bcrypt is None or not encoded.startswith(("$2a$", "$2b$", "$2y$")):
+        return False
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), encoded.encode("utf-8"))
+    except ValueError:
+        return False
 
 
 def _load_users() -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -113,19 +130,40 @@ def _public(user: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _public_legacy(user: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(user.get("user_id")),
+        "name": str(user.get("display_name") or user.get("username") or ""),
+        "email": str(user.get("email") or ""),
+        "role": "admin" if user.get("role") == "admin" else "user",
+    }
+
+
 async def login(identifier: str, password: str) -> tuple[str, dict[str, Any]]:
     user = find_user(identifier)
-    if user is None or not verify_scrypt(password, str(user.get("passwordHash") or "")):
-        raise SubsonicError(40, "Wrong username or password.")
-    status = str(user.get("status") or "active")
-    if status == "pending":
-        raise SubsonicError(40, "This account is waiting for admin approval.")
-    if status != "active":
-        raise SubsonicError(40, "This account is locked.")
-    public = _public(user)
-    token = secrets.token_urlsafe(32)
-    await db.create_session(hash_token(token), public)
-    return token, public
+    if user is not None and verify_scrypt(password, str(user.get("passwordHash") or "")):
+        status = str(user.get("status") or "active")
+        if status == "pending":
+            raise SubsonicError(40, "This account is waiting for admin approval.")
+        if status != "active":
+            raise SubsonicError(40, "This account is locked.")
+        public = _public(user)
+        token = secrets.token_urlsafe(32)
+        await db.create_session(hash_token(token), public)
+        return token, public
+
+    # Accounts imported from the old hify database keep their bcrypt hash.
+    # Trying both lets a username that exists in both systems pick whichever
+    # password the user actually typed.
+    legacy = await db.legacy_user(identifier=identifier)
+    if legacy is not None and verify_bcrypt(password, str(legacy.get("password_hash") or "")):
+        public = _public_legacy(legacy)
+        token = secrets.token_urlsafe(32)
+        await db.touch_legacy_login(public["id"])
+        await db.create_session(hash_token(token), public)
+        return token, public
+
+    raise SubsonicError(40, "Wrong username or password.")
 
 
 def _token_from_request(request: Request) -> str:
@@ -143,9 +181,13 @@ async def current_user(request: Request) -> dict[str, Any]:
     if session is None:
         raise SubsonicError(40, "Session expired. Sign in again.")
     user = user_by_id(str(session["user_id"]))
-    if user is None or str(user.get("status")) != "active":
+    if user is not None:
+        if str(user.get("status")) != "active":
+            await db.delete_session(hash_token(token))
+            raise SubsonicError(40, "This account is locked.")
+    elif await db.legacy_user(user_id=str(session["user_id"])) is None:
         await db.delete_session(hash_token(token))
-        raise SubsonicError(40, "This account is locked.")
+        raise SubsonicError(40, "Session expired. Sign in again.")
     return {
         "user_id": str(session["user_id"]),
         "username": str(session["username"]),

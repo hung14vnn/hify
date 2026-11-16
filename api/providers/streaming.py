@@ -199,20 +199,11 @@ class StreamService:
         )
 
     async def _proxy_yt(self, video_id: str, range_header: str | None) -> StreamingResponse:
-        # googlevideo rejects an open-ended range on the first request ("bytes=0-"),
-        # which is exactly what <audio> sends. Bound it to 1 MiB; the element asks
-        # for the next slice when it needs it.
-        bounded = range_header
-        if range_header:
-            match = re.fullmatch(r"bytes=(\d+)-", range_header.strip())
-            if match:
-                start = int(match.group(1))
-                bounded = f"bytes={start}-{start + 1024 * 1024 - 1}"
         last_error: Exception | None = None
         for attempt in range(3):
             try:
                 chunks, headers, status = await self._ytmusic.proxy_stream(
-                    video_id, range_header=bounded, fmt=settings.yt_format
+                    video_id, range_header=range_header, fmt=settings.yt_format
                 )
                 break
             except httpx.HTTPStatusError as exc:

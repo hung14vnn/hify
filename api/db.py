@@ -96,6 +96,37 @@ CREATE TABLE IF NOT EXISTS user_prefs (
     user_id TEXT PRIMARY KEY,
     quality TEXT NOT NULL DEFAULT 'HI_RES_LOSSLESS'
 );
+
+CREATE TABLE IF NOT EXISTS legacy_users (
+    user_id       TEXT PRIMARY KEY,
+    username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    display_name  TEXT NOT NULL DEFAULT '',
+    email         TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL,
+    role          TEXT NOT NULL DEFAULT 'user',
+    created_at    INTEGER NOT NULL,
+    last_login_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS legacy_downloads (
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    track_id     TEXT,
+    title        TEXT NOT NULL,
+    artist       TEXT NOT NULL,
+    album        TEXT NOT NULL,
+    file_path    TEXT,
+    file_format  TEXT,
+    bit_rate     INTEGER,
+    sample_rate  INTEGER,
+    bit_depth    INTEGER,
+    source       TEXT,
+    status       TEXT,
+    created_at   INTEGER NOT NULL,
+    payload      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_legacy_downloads_user
+    ON legacy_downloads(user_id, created_at DESC);
 """
 
 
@@ -573,3 +604,59 @@ def _set_quality(user_id: str, quality: str) -> str:
 
 async def set_quality(user_id: str, quality: str) -> str:
     return await _run(lambda: _set_quality(user_id, quality))
+
+
+# --- legacy hify accounts (imported once from the old library.db) -----------
+
+
+def _legacy_user(identifier: str | None, user_id: str | None) -> dict[str, Any] | None:
+    with _connect() as conn:
+        if user_id:
+            row = conn.execute(
+                "SELECT * FROM legacy_users WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        else:
+            key = (identifier or "").strip()
+            if not key:
+                return None
+            row = conn.execute(
+                "SELECT * FROM legacy_users WHERE username = ?"
+                " OR (email <> '' AND email = ?) LIMIT 1",
+                (key, key),
+            ).fetchone()
+    return dict(row) if row else None
+
+
+async def legacy_user(
+    identifier: str | None = None, user_id: str | None = None
+) -> dict[str, Any] | None:
+    return await _run(lambda: _legacy_user(identifier, user_id))
+
+
+def _touch_legacy_login(user_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE legacy_users SET last_login_at = ? WHERE user_id = ?",
+            (int(time.time()), user_id),
+        )
+        conn.commit()
+
+
+async def touch_legacy_login(user_id: str) -> None:
+    await _run(lambda: _touch_legacy_login(user_id))
+
+
+def _legacy_downloads(user_id: str, limit: int) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, user_id, track_id, title, artist, album, file_path,"
+            " file_format, bit_rate, sample_rate, bit_depth, source, status, created_at"
+            " FROM legacy_downloads WHERE user_id IN (?, '')"
+            " ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+async def legacy_downloads(user_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    return await _run(lambda: _legacy_downloads(user_id, limit))
