@@ -2327,18 +2327,12 @@
 		}
 	}
 
-	/* Landscape keeps the previous look: full-bleed soft wash and the art card. */
-	@media (max-width: 899px) and (orientation: landscape) {
+	@media (orientation: landscape) {
 		.backdrop-art {
-			inset: -8%;
-			width: 116%;
-			height: 116%;
-			filter: saturate(1.1) brightness(0.55);
-			-webkit-mask-image: none;
-			mask-image: none;
+			display: none;
 		}
 		.tint {
-			background: linear-gradient(180deg, rgb(0 0 0 / 0.45), rgb(0 0 0 / 0.72));
+			background: linear-gradient(180deg, var(--top), var(--bottom));
 		}
 	}
 </style>
