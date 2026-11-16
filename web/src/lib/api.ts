@@ -493,7 +493,7 @@ export async function getSubsonicGenres() {
 }
 
 /** Online catalog the server blends into search results. */
-export type SearchSource = 'spotify' | 'ytmusic';
+export type SearchSource = 'spotify' | 'ytmusic' | 'youtube';
 
 export async function search(
 	query: string,
@@ -703,10 +703,17 @@ export async function setLastfmScrobbling(enabled: boolean): Promise<LastfmStatu
 export async function connectLastfm(): Promise<string> {
 	if (!session) throw new SubsonicError(10, 'Not signed in');
 	const root = session.base.replace(/\/subsonic$/, '');
-	const params = new URLSearchParams();
-	if (session.apiKey) params.set('apiKey', session.apiKey);
-	const res = await fetch(`${root}/api/v1/lastfm/connect?${params.toString()}`);
-	if (!res.ok) throw new Error('Last.fm is not configured on this server');
+	const headers: Record<string, string> = {};
+	if (session.apiKey) headers.Authorization = `Bearer ${session.apiKey}`;
+	const res = await fetch(`${root}/api/v1/lastfm/connect`, { headers, cache: 'no-store', credentials: 'include' });
+	if (!res.ok) {
+		const error = await res.json().catch(() => null);
+		throw new Error(
+			typeof error?.detail === 'string'
+				? error.detail
+				: `Couldn’t connect to Last.fm (HTTP ${res.status})`
+		);
+	}
 	const data = (await res.json()) as { url?: string };
 	if (!data.url) throw new Error('Last.fm did not return a sign-in page');
 	return data.url;
@@ -761,7 +768,7 @@ export async function getLastfmRecommendations(refresh = false): Promise<LastfmS
  * scrobbled: the server names them from the provider.
  */
 function isRemoteTrack(id: string | undefined): boolean {
-	return !!id && (id.startsWith('yt-') || id.startsWith('st-') || id.startsWith('kr-'));
+	return !!id && (id.startsWith('yt-') || id.startsWith('ytv-') || id.startsWith('st-') || id.startsWith('kr-'));
 }
 
 export async function scrobble(id: string, submission: boolean, coverArt?: string) {

@@ -172,7 +172,7 @@ const SYSTEM_PAUSE_WINDOW_MS = 2_000;
 
 /** Lead time (seconds before the end) at which the whole-track prefetch of `id` starts. */
 function blobLeadFor(id: string): number {
-	return id.startsWith('yt-') ? BLOB_LEAD_YT_S : BLOB_LEAD_S;
+	return id.startsWith('yt-') || id.startsWith('ytv-') ? BLOB_LEAD_YT_S : BLOB_LEAD_S;
 }
 
 /** iPadOS reports a Mac user agent; touch support tells them apart. */
@@ -775,7 +775,7 @@ class Player {
 		}
 		const song = this.current;
 		if (!song) return null;
-		if (song.karaokeOf || song.id.startsWith('yt-') || song.id.startsWith('st-')) {
+		if (song.karaokeOf || song.id.startsWith('yt-') || song.id.startsWith('ytv-') || song.id.startsWith('st-')) {
 			return 'Karaoke works with local library tracks only.';
 		}
 		const run = ++this.karaokeRun;
@@ -1282,7 +1282,7 @@ class Player {
 
 	private async learnCodec(song: Song, offline: boolean) {
 		if (offline) return;
-		if (!song.id.startsWith('st-') && !song.id.startsWith('yt-')) return;
+		if (!song.id.startsWith('st-') && !song.id.startsWith('yt-') && !song.id.startsWith('ytv-')) return;
 		try {
 			// The same two-byte probe `warmNext` uses; it also resolves a cold YouTube
 			// track on the server, so it is not wasted work.

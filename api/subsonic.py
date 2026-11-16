@@ -97,6 +97,20 @@ async def search3(request: Request, user=Depends(current_user)) -> JSONResponse:
     song_offset = _int(request.query_params.get("songOffset"), 0)
     if not query:
         return _ok(searchResult3={})
+    if source == "youtube":
+        count = max(0, min(song_count, 50))
+        offset = max(0, min(song_offset, 200))
+        if not count:
+            return _ok(searchResult3={"song": []})
+        videos = await services["ytmusic"].search_videos(query, limit=count + offset)
+        songs = [song_from_yt({
+            "videoId": item["id"],
+            "title": item["title"],
+            "artists": [{"name": item["channel"]}],
+            "duration_seconds": item.get("duration"),
+            "thumbnails": item.get("thumbnails"),
+        }, video=True) for item in videos[offset:offset + count]]
+        return _ok(searchResult3={"song": songs})
     if source == "ytmusic":
         tracks = await services["ytmusic"].search_tracks(query, limit=song_count)
         songs = [song_from_yt(item) for item in tracks]

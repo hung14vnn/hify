@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
+import secrets
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -30,6 +32,7 @@ class LastfmService:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._http = client
         self._pending: dict[str, tuple[str, float]] = {}
+        self._link_lock = asyncio.Lock()
 
     @property
     def available(self) -> bool:
@@ -51,34 +54,45 @@ class LastfmService:
             else:
                 response = await self._http.get(_API, params=payload, timeout=10.0)
             data = response.json()
+            if isinstance(data, dict) and data.get("error"):
+                logger.warning("lastfm %s rejected: error %s", method, data["error"])
+                return None
+            response.raise_for_status()
             return data if isinstance(data, dict) else None
         except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("lastfm %s failed: %s", method, exc)
+            logger.warning("lastfm %s failed: %s", method, type(exc).__name__)
             return None
 
-    async def connect_url(self, user_id: str) -> str | None:
-        data = await self._call("auth.getToken")
-        token = (data or {}).get("token")
-        if not token:
-            return None
-        self._pending[str(token)] = (user_id, time.time() + 600)
-        return (
-            f"{_AUTH}?api_key={settings.lastfm_api_key}"
-            f"&cb={quote(settings.lastfm_callback_url, safe='')}&token={token}"
-        )
+    async def connect_url(self, user_id: str) -> tuple[str, str]:
+        async with self._link_lock:
+            now = time.time()
+            self._pending = {
+                state: pending for state, pending in self._pending.items()
+                if pending[1] > now and pending[0] != user_id
+            }
+            state = secrets.token_urlsafe(32)
+            self._pending[state] = (user_id, now + 600)
+            callback = urlsplit(settings.lastfm_callback_url)
+            query = dict(parse_qsl(callback.query))
+            query["state"] = state
+            callback_url = urlunsplit(callback._replace(query=urlencode(query)))
+            url = f"{_AUTH}?{urlencode({'api_key': settings.lastfm_api_key, 'cb': callback_url})}"
+            return url, state
 
-    async def finish(self, token: str) -> str | None:
-        pending = self._pending.pop(token, None)
-        if pending is None or pending[1] < time.time():
-            return None
-        user_id = pending[0]
-        data = await self._call("auth.getSession", token=token)
-        session = (data or {}).get("session") or {}
-        key = session.get("key")
-        if not key:
-            return None
-        await db.lastfm_save(user_id, str(key), str(session.get("name") or ""))
-        return user_id
+    async def finish(self, token: str, state: str) -> str | None:
+        # Serialize starts and completions so an older callback cannot overwrite a newer link.
+        async with self._link_lock:
+            pending = self._pending.pop(state, None)
+            if pending is None or pending[1] < time.time():
+                return None
+            user_id = pending[0]
+            data = await self._call("auth.getSession", token=token)
+            session = (data or {}).get("session") or {}
+            key = session.get("key")
+            if not key:
+                return None
+            await db.lastfm_save(user_id, str(key), str(session.get("name") or ""))
+            return user_id
 
     async def status(self, user_id: str) -> dict[str, Any]:
         connection = await db.lastfm_get(user_id)

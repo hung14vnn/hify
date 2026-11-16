@@ -264,7 +264,7 @@
 	{/await}
 	{#await newReleases then list}
 		{#if list.length}
-			<Shelf title="New Releases" size="lg">
+			<Shelf title="New Releases">
 				{#each list as album (album.id)}<AlbumCard {album} />{/each}
 			</Shelf>
 		{/if}

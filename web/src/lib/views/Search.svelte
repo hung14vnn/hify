@@ -12,6 +12,7 @@
 
 	let results = $state<Awaited<ReturnType<typeof search>> | null>(null);
 	let loading = $state(false);
+	let error = $state('');
 	const genres = getGenres().catch(() => []);
 	let seq = 0;
 	let shownSource: SearchSource | undefined;
@@ -32,13 +33,15 @@
 	const SOURCE_KEY = 'search:source';
 	const sources: { id: SearchSource; label: string }[] = [
 		{ id: 'spotify', label: 'Spotify' },
-		{ id: 'ytmusic', label: 'YouTube Music' }
+		{ id: 'ytmusic', label: 'YouTube Music' },
+		{ id: 'youtube', label: 'YouTube' }
 	];
 	let source = $state<SearchSource>(savedSource());
 
 	function savedSource(): SearchSource {
 		try {
-			return localStorage.getItem(SOURCE_KEY) === 'ytmusic' ? 'ytmusic' : 'spotify';
+			const saved = localStorage.getItem(SOURCE_KEY);
+			return saved === 'ytmusic' || saved === 'youtube' ? saved : 'spotify';
 		} catch {
 			return 'spotify';
 		}
@@ -56,11 +59,13 @@
 	$effect(() => {
 		const q = effectiveQuery.trim();
 		const from = source;
+		const mine = ++seq;
+		error = '';
 		if (!q) {
 			results = null;
+			loading = false;
 			return;
 		}
-		const mine = ++seq;
 		loading = true;
 		// Keep showing old results while typing, but not another catalog's.
 		if (from !== shownSource) results = null;
@@ -73,10 +78,17 @@
 		const timer = setTimeout(() => {
 			search(q, { artist: 12, album: 20, song: 10, playlist: 10 }, 0, false, from)
 				.then((r) => mine === seq && (results = r))
-				.catch(() => mine === seq && (results = { artists: [], albums: [], songs: [], playlists: [] }))
+				.catch(() => {
+					if (mine !== seq) return;
+					results = null;
+					error = `Couldn’t search ${sources.find((s) => s.id === from)?.label}. Please try again.`;
+				})
 				.finally(() => mine === seq && (loading = false));
 		}, delay);
-		return () => clearTimeout(timer);
+		return () => {
+			clearTimeout(timer);
+			if (mine === seq) seq++;
+		};
 	});
 
 	const empty = $derived(results && !results.artists.length && !results.albums.length && !results.songs.length && !results.playlists?.length);
@@ -101,6 +113,8 @@
 		{/await}
 	{:else if loading && !results}
 		<div class="spinner"></div>
+	{:else if error}
+		<div class="empty-state" role="alert"><p>{error}</p></div>
 	{:else if empty}
 		<div class="empty-state">
 			<h3>No Results</h3>
@@ -132,7 +146,7 @@
 <style>
 	.seg {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: 1fr auto 1fr;
 		margin: 0 var(--gutter) 12px;
 		padding: 2px;
 		border-radius: 999px;
@@ -140,7 +154,7 @@
 	}
 	.seg button {
 		height: 32px;
-		padding: 0 16px;
+		padding: 0 10px;
 		border-radius: 999px;
 		font-size: 14px;
 		font-weight: 500;

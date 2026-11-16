@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import {
     connectLastfm,
     getLastfmStatus,
@@ -49,11 +50,11 @@
     ["webaudio", "Web Audio (Beta)"],
   ];
 
-  // Last.fm is linked in the web app (Settings › Connections); here it is shown,
-  // and scrobbling can be switched on or off.
   let lastfm = $state<LastfmStatus | null>(null);
   let lastfmError = $state("");
   let lastfmBusy = $state(false);
+  let disposed = false;
+  onDestroy(() => { disposed = true; });
 
   getLastfmStatus()
     .then((s) => (lastfm = s))
@@ -72,18 +73,40 @@
   }
 
   async function connectAccount() {
+    if (lastfmBusy) return;
+    // Open during the click gesture so browsers don't block it after the API call.
+    const popup = window.open("about:blank", "_blank");
+    if (!popup) {
+      ui.showToast("Allow pop-ups for this site, then try connecting Last.fm again.");
+      return;
+    }
+    popup.opener = null;
     lastfmBusy = true;
+    let opened = false;
     try {
       const url = await connectLastfm();
-      window.open(url, "_blank", "noopener");
-      const deadline = Date.now() + 120_000;
-      while (Date.now() < deadline && !lastfm?.linked) {
+      if (disposed) {
+        popup.close();
+        return;
+      }
+      if (popup.closed) return;
+      popup.location.replace(url);
+      opened = true;
+      const deadline = Date.now() + 600_000;
+      while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        lastfm = await getLastfmStatus();
-        if (lastfm.linked) break;
+        if (disposed) return;
+        const status = await getLastfmStatus();
+        if (disposed) return;
+        lastfm = status;
+        if (lastfm.linked || popup.closed) break;
+      }
+      if (!lastfm?.linked && !popup.closed) {
+        ui.showToast("Last.fm connection timed out. Please try again.");
       }
     } catch (err) {
-      ui.showToast(err instanceof Error ? err.message : "Couldn’t open Last.fm");
+      if (!opened) popup.close();
+      if (!disposed) ui.showToast(err instanceof Error ? err.message : "Couldn’t open Last.fm");
     } finally {
       lastfmBusy = false;
     }

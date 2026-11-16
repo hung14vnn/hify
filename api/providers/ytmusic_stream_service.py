@@ -248,7 +248,7 @@ class _YtDlp:
     @staticmethod
     def extract_video(video_id: str, fmt: str = "opus") -> StreamInfo | None:
         """Extract the audio URL for a known YouTube Music video."""
-        url = f"https://music.youtube.com/watch?v={video_id}"
+        url = f"https://www.youtube.com/watch?v={video_id}"
         options = _YDL_M4A_OPTIONS if fmt == "m4a" else _YDL_OPUS_OPTIONS
         with YoutubeDL(options) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -298,6 +298,7 @@ class _YtDlp:
                         "title": str(entry.get("title") or ""),
                         "duration": entry.get("duration"),
                         "channel": str(entry.get("channel") or entry.get("uploader") or ""),
+                        "thumbnails": entry.get("thumbnails") or [],
                     }
                 )
         return results
@@ -761,6 +762,16 @@ class YTMusicStreamService:
     async def search_videos(self, query: str, limit: int = 10) -> list[dict]:
         return await self._run_blocking(_YtDlp.search_videos, query, limit, what="search")
 
+    async def video_meta(self, video_id: str) -> dict:
+        info = await self._resolve(f"ytv-{video_id}", None, None, settings.yt_format)
+        return {
+            "videoId": video_id,
+            "title": info.title,
+            "artists": [{"name": info.artist}],
+            "duration_seconds": info.duration_s,
+            "thumbnails": [{"url": info.thumbnail}] if info.thumbnail else [],
+        }
+
     def evict_by_video_id(self, video_id: str) -> None:
         """Drop every cached entry for *video_id*."""
         self._cache.evict(f"{video_id}:opus")
@@ -939,15 +950,16 @@ class YTMusicStreamService:
         return await asyncio.shield(task)
 
     async def _extract_uncached(self, video_id: str, fmt: str) -> StreamInfo:
-        """Extract the audio URL for *video_id*, upgrading MV videos to studio audio."""
-        result = await self._run_blocking(_YtDlp.extract_video, video_id, fmt, what="extraction")
+        original = video_id.startswith("ytv-")
+        source_id = video_id[4:] if original else video_id
+        result = await self._run_blocking(_YtDlp.extract_video, source_id, fmt, what="extraction")
         if result is None:
             raise ValueError(f"Could not extract audio for video {video_id}")
 
-        if _MV_REGEX.search(result.source_title) and not _KARAOKE_REGEX.search(result.source_title):
+        if not original and _MV_REGEX.search(result.source_title) and not _KARAOKE_REGEX.search(result.source_title):
             result = await self._upgrade_mv_to_audio(result, fmt)
         remember_duration(video_id, result.duration_s)
-        return result
+        return replace(result, video_id=video_id) if original else result
 
     async def _upgrade_mv_to_audio(self, mv: StreamInfo, fmt: str) -> StreamInfo:
         """Try to swap an MV's audio URL for the matching studio track's.

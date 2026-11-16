@@ -125,6 +125,11 @@ class StreamService:
             song = song_from_spotify(track)
             remember(song)
             return song
+        if song_id.startswith("ytv-"):
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
+                return None
+            raw = await self._ytmusic.video_meta(song_id[4:])
+            return song_from_yt(raw, video=True)
         if song_id.startswith("yt-"):
             video_id = song_id[3:]
             if not video_id:
@@ -228,6 +233,10 @@ class StreamService:
     ) -> StreamingResponse:
         if song_id.startswith("kr-"):
             raise SubsonicError(70, "Karaoke is not available")
+        if song_id.startswith("ytv-"):
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
+                raise SubsonicError(70, "Invalid YouTube video id")
+            return await self._proxy_yt(song_id, range_header)
         is_yt = song_id.startswith("yt-")
         if not is_yt and not song_id.startswith("st-"):
             raise SubsonicError(70, "Invalid id type")

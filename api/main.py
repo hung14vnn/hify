@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
+from html import escape
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -63,7 +67,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="hify", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=list(settings.cors_origins),
+    allow_origins=[origin for origin in settings.cors_origins if origin != "*"],
+    allow_origin_regex=r"https?://[^/]+" if "*" in settings.cors_origins else None,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -134,16 +140,24 @@ async def lastfm_connect(request: Request, user=Depends(auth.current_user_http))
     service: LastfmService = request.app.state.services["lastfm"]
     if not service.available:
         raise HTTPException(status_code=503, detail="Last.fm API key is not configured")
-    url = await service.connect_url(user["user_id"])
-    if not url:
-        raise HTTPException(status_code=502, detail="Last.fm did not issue a token")
-    return JSONResponse({"url": url})
+    url, state = await service.connect_url(user["user_id"])
+    response = JSONResponse({"url": url}, headers={"Cache-Control": "no-store"})
+    callback = urlsplit(settings.lastfm_callback_url)
+    response.set_cookie(
+        "lastfm_state", state, max_age=600, httponly=True, samesite="lax",
+        secure=callback.scheme == "https", path=callback.path,
+    )
+    return response
 
 
 @app.get("/api/v1/lastfm/callback")
-async def lastfm_callback(request: Request, token: str = "") -> HTMLResponse:
+async def lastfm_callback(request: Request, token: str = "", state: str = "") -> HTMLResponse:
     service: LastfmService = request.app.state.services["lastfm"]
-    user_id = await service.finish(token) if token else None
+    browser_state = request.cookies.get("lastfm_state", "")
+    valid_state = bool(state and browser_state) and secrets.compare_digest(
+        state.encode(), browser_state.encode(),
+    )
+    user_id = await service.finish(token, state) if token and valid_state else None
     ok = user_id is not None
     return_url = settings.lastfm_return_url
     title = "Last.fm connected" if ok else "Last.fm connection failed"
@@ -152,15 +166,25 @@ async def lastfm_callback(request: Request, token: str = "") -> HTMLResponse:
         if ok
         else "The link could not be completed. Start again from the player."
     )
+    redirect = ""
+    if ok:
+        target = json.dumps(return_url).replace("<", "\\u003c")
+        redirect = f"<script>setTimeout(function(){{location.href={target}}},1200)</script>"
     html = f"""<!doctype html><meta charset="utf-8"><title>{title}</title>
 <body style="font-family:system-ui;background:#111;color:#eee;display:grid;place-items:center;height:100vh;margin:0">
 <div style="text-align:center;max-width:420px">
 <h1 style="font-size:20px">{title}</h1><p style="color:#aaa">{message}</p>
-<p><a style="color:#fb5c74" href="{return_url}">Back to the player</a></p>
+<p><a style="color:#fb5c74" href="{escape(return_url, quote=True)}">Back to the player</a></p>
 </div>
-<script>setTimeout(function(){{location.href={return_url!r}}},1200)</script>
+{redirect}
 </body>"""
-    return HTMLResponse(html)
+    response = HTMLResponse(
+        html, status_code=200 if ok else 400,
+        headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+    )
+    if valid_state:
+        response.delete_cookie("lastfm_state", path=urlsplit(settings.lastfm_callback_url).path)
+    return response
 
 
 @app.post("/api/v1/lastfm/disconnect")

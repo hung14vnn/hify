@@ -104,7 +104,7 @@ def _yt_image(thumbnails: Any) -> str | None:
     return None
 
 
-def song_from_yt(track: dict[str, Any]) -> dict[str, Any]:
+def song_from_yt(track: dict[str, Any], *, video: bool = False) -> dict[str, Any]:
     video_id = track.get("videoId") or track.get("video_id") or ""
     artists = track.get("artists")
     names: list[str] = []
@@ -116,7 +116,7 @@ def song_from_yt(track: dict[str, Any]) -> dict[str, Any]:
                 names.append(artist)
     duration = track.get("duration_seconds") or track.get("duration")
     song = {
-        "id": f"yt-{video_id}",
+        "id": f"{'ytv' if video else 'yt'}-{video_id}",
         "title": str(track.get("title") or ""),
         "album": str((track.get("album") or {}).get("name") or "") if isinstance(track.get("album"), dict) else "",
         "artist": ", ".join(names) or "Unknown Artist",
