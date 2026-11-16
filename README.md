@@ -57,10 +57,11 @@ Copy `.env.example` to `.env` in the repo root.
 
 ## Migrating the old hify library
 
-`api/scripts/migrate_hify.py` imports users, playlists and downloaded-library
-metadata from the old `cache/library.db`. Local tracks are resolved to Spotify or
-YouTube Music ids; a per-user `Downloaded (old hify)` playlist holds the shared
-library, and the `legacy_downloads` table keeps file paths and quality data.
+`api/scripts/migrate_hify.py` imports users, playlists, per-user assigned
+tracks (as starred songs), play history and downloaded-library metadata from the
+old `cache/library.db`. Local tracks are resolved to Spotify or YouTube Music ids;
+a per-user `Downloaded (old hify)` playlist holds the shared library, and the
+`legacy_downloads` table keeps file paths and quality data.
 
 ```bash
 cd api
@@ -69,7 +70,8 @@ python scripts/migrate_hify.py --old-db ../legacy/library.db
 ```
 
 The script snapshots the old database, caches resolution results and writes a JSON
-report with unmatched tracks. Re-running replaces the imported playlists.
+report with unmatched tracks. Re-running replaces the imported playlists and adds
+missing history/starred rows without touching new plays or stars.
 
 ## App endpoints (Subsonic subset the player uses)
 

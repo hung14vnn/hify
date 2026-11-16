@@ -61,6 +61,8 @@ export function clearSession() {
 }
 
 const CACHE_PREFIX = 'music.cache:';
+// Bump when cached API shapes/content change so old empty or stale entries are ignored.
+const CACHE_VERSION = 'v2';
 type CacheEntry = { at: number; data: unknown };
 const memo = new Map<string, CacheEntry>();
 // IndexedDB rather than localStorage: async, and big libraries (getArtists, getStarred2)
@@ -139,7 +141,7 @@ const DEFAULT_MAX_AGE = 24 * 60 * 60_000;
 
 function cacheKey(key: string) {
 	const user = session?.username ?? (session?.apiKey ? md5(session.apiKey).slice(0, 8) : '');
-	return `${CACHE_PREFIX}${session?.base}|${user}|${key}`;
+	return `${CACHE_PREFIX}${CACHE_VERSION}|${session?.base}|${user}|${key}`;
 }
 
 export interface CachedOptions<T> {

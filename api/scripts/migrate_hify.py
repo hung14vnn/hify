@@ -265,8 +265,11 @@ def read_old(path: Path) -> dict[str, list[dict[str, Any]]]:
             "SELECT * FROM library_playlist_tracks ORDER BY playlist_id, position"
         ),
         "local_tracks": rows("SELECT * FROM local_tracks ORDER BY imported_at"),
+        "track_identities": rows("SELECT * FROM local_track_external_identities"),
         "youtube_links": rows("SELECT * FROM youtube_track_links"),
         "download_tasks": rows("SELECT * FROM download_tasks ORDER BY created_at"),
+        "play_history": rows("SELECT * FROM library_play_history ORDER BY played_at"),
+        "selections": rows("SELECT * FROM library_user_selections ORDER BY selected_at"),
         "history_users": rows("SELECT DISTINCT user_id FROM library_play_history"),
         "selection_users": rows("SELECT DISTINCT user_id FROM library_user_selections"),
     }
@@ -301,6 +304,21 @@ def playlist_payload(
             resolved = dict(resolved, coverArt=item["cover_url"])
         return resolved
     return None
+
+
+def best_track(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    unique = {str(track["id"]): track for track in candidates}
+    if not unique:
+        return None
+    return max(
+        unique.values(),
+        key=lambda track: (
+            track.get("availability") == "indexed",
+            track.get("file_format") == "flac",
+            int(track.get("bit_depth") or 0),
+            float(track.get("imported_at") or 0),
+        ),
+    )
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -366,6 +384,17 @@ async def run(args: argparse.Namespace) -> int:
         except (TypeError, ValueError):
             continue
         yt_links[key] = str(link["video_id"])
+
+    provider_tracks: dict[str, list[dict[str, Any]]] = {}
+    for track in data["local_tracks"]:
+        key = str(track.get("embedded_recording_mbid") or "").strip().casefold()
+        if key:
+            provider_tracks.setdefault(key, []).append(track)
+    for identity in data["track_identities"]:
+        track = local_by_id.get(str(identity.get("local_track_id") or ""))
+        key = str(identity.get("recording_mbid") or "").strip().casefold()
+        if track is not None and key:
+            provider_tracks.setdefault(key, []).append(track)
 
     cache_path = Path(args.cache).resolve() if args.cache else new_path.with_name(
         "migration-cache.json"
@@ -496,6 +525,108 @@ async def run(args: argparse.Namespace) -> int:
         if number % 20 == 0:
             print(f"library tracks: {number}/{len(indexed)}", flush=True)
 
+    history_entries: list[dict[str, Any]] = []
+    history_skipped = 0
+    for row in data["play_history"]:
+        owner = str(row.get("user_id") or "")
+        if owner not in user_names:
+            history_skipped += 1
+            continue
+        local = local_by_id.get(str(row.get("local_track_id") or ""))
+        title = str((local or {}).get("title") or row.get("track_name") or "")
+        artist = str((local or {}).get("artist_name") or row.get("artist_name") or "")
+        album = str((local or {}).get("album_title") or row.get("album_name") or "")
+        duration = clean_duration((local or {}).get("duration_seconds"))
+        if duration is None and row.get("duration_ms") is not None:
+            try:
+                duration = clean_duration(float(row["duration_ms"]) / 1000)
+            except (TypeError, ValueError):
+                duration = None
+        payload = resolved_local.get(str(local["id"])) if local is not None else None
+        if payload is None:
+            payload = await resolver.resolve(title, artist, album, duration)
+        if payload is None:
+            history_skipped += 1
+            continue
+        history_entries.append(
+            {
+                "user_id": owner,
+                "track_id": payload["id"],
+                "payload": payload,
+                "played_at": epoch(row.get("played_at")),
+            }
+        )
+
+    spotify_star_cache: dict[str, dict[str, Any] | None] = {}
+
+    async def spotify_by_id(track_id: str) -> dict[str, Any] | None:
+        if track_id not in spotify_star_cache:
+            try:
+                track = await resolver.spotify.get_track(track_id)
+                spotify_star_cache[track_id] = (
+                    song_from_spotify(track) if track.get("id") else None
+                )
+            except Exception:  # noqa: BLE001 - fall back to a metadata search
+                spotify_star_cache[track_id] = None
+        return spotify_star_cache[track_id]
+
+    starred_entries: list[dict[str, Any]] = []
+    starred_missing: list[dict[str, str]] = []
+    for selection in data["selections"]:
+        if selection.get("item_kind") != "track":
+            continue
+        owner = str(selection.get("user_id") or "")
+        provider = str(selection.get("provider_id") or "").strip()
+        if owner not in user_names or not provider:
+            continue
+        candidate = best_track(provider_tracks.get(provider.casefold(), []))
+        if candidate is None:
+            starred_missing.append({"user": user_names.get(owner, owner), "provider_id": provider})
+            continue
+        local_id = str(candidate["id"])
+        title = str(candidate.get("title") or "")
+        artist = str(candidate.get("artist_name") or "")
+        album = str(candidate.get("album_title") or "")
+        duration = clean_duration(candidate.get("duration_seconds"))
+        original = str(candidate.get("embedded_recording_mbid") or "").strip()
+        payload: dict[str, Any] | None = None
+        lowered = original.casefold()
+        if lowered.startswith("spotify:track:"):
+            payload = await spotify_by_id(original.split(":", 2)[2])
+        elif lowered.startswith("youtube:track:"):
+            cover = (resolved_local.get(local_id) or {}).get("coverArt")
+            payload = payload_from_yt(
+                original.split(":", 2)[2],
+                title=title,
+                artist=artist,
+                album=album,
+                duration=duration,
+                cover=cover,
+            )
+        if payload is None:
+            payload = resolved_local.get(local_id)
+        if payload is None:
+            payload = await resolver.resolve(title, artist, album, duration)
+        if payload is None:
+            starred_missing.append({"user": user_names.get(owner, owner), "provider_id": provider})
+            continue
+        starred_entries.append(
+            {
+                "user_id": owner,
+                "track_id": payload["id"],
+                "payload": payload,
+                "starred_at": epoch(selection.get("selected_at")),
+            }
+        )
+
+    starred_unique: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in starred_entries:
+        key = (entry["user_id"], entry["track_id"])
+        previous = starred_unique.get(key)
+        if previous is None or entry["starred_at"] > previous["starred_at"]:
+            starred_unique[key] = entry
+    starred_entries = list(starred_unique.values())
+
     legacy_downloads: list[dict[str, Any]] = []
     for track in data["local_tracks"]:
         resolved = resolved_local.get(str(track["id"]))
@@ -589,6 +720,17 @@ async def run(args: argparse.Namespace) -> int:
         "tasks": len(data["download_tasks"]),
         "playlists": len(download_playlists),
     }
+    report["history"] = {
+        "rows": len(data["play_history"]),
+        "resolved": len(history_entries),
+        "skipped": history_skipped,
+    }
+    report["starred"] = {
+        "selections": sum(1 for row in data["selections"] if row.get("item_kind") == "track"),
+        "migrated": len(starred_entries),
+        "unresolved": len(starred_missing),
+        "unresolved_ids": starred_missing[:80],
+    }
     resolver.save()
     await http.aclose()
 
@@ -601,7 +743,8 @@ async def run(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(
             f"dry run: {len(users)} users, {len(imported_playlists)} playlists, "
-            f"{len(legacy_downloads)} download rows, {len(download_playlists)} downloaded playlists"
+            f"{len(legacy_downloads)} download rows, {len(download_playlists)} downloaded playlists, "
+            f"{len(history_entries)} history rows, {len(starred_entries)} starred tracks"
         )
         print(f"resolution: {resolver.stats}")
         print(f"report: {report_path}")
@@ -612,6 +755,8 @@ async def run(args: argparse.Namespace) -> int:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(db.SCHEMA)
+    history_inserted = 0
+    starred_inserted = 0
     try:
         conn.execute("BEGIN")
         conn.execute("DELETE FROM legacy_users")
@@ -688,6 +833,48 @@ async def run(args: argparse.Namespace) -> int:
                         json.dumps(payload, ensure_ascii=False),
                     ),
                 )
+        existing_history = {
+            tuple(row)
+            for row in conn.execute(
+                "SELECT user_id, track_id, played_at FROM play_history"
+            )
+        }
+        for entry in history_entries:
+            key = (entry["user_id"], entry["track_id"], entry["played_at"])
+            if key in existing_history:
+                continue
+            conn.execute(
+                "INSERT INTO play_history (user_id, track_id, payload, played_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    entry["user_id"],
+                    entry["track_id"],
+                    json.dumps(entry["payload"], ensure_ascii=False),
+                    entry["played_at"],
+                ),
+            )
+            existing_history.add(key)
+            history_inserted += 1
+        existing_stars = {
+            tuple(row)
+            for row in conn.execute("SELECT user_id, track_id FROM liked_tracks")
+        }
+        for entry in starred_entries:
+            key = (entry["user_id"], entry["track_id"])
+            if key in existing_stars:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO liked_tracks (user_id, track_id, payload, starred_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    entry["user_id"],
+                    entry["track_id"],
+                    json.dumps(entry["payload"], ensure_ascii=False),
+                    entry["starred_at"],
+                ),
+            )
+            existing_stars.add(key)
+            starred_inserted += 1
         conn.commit()
     except Exception:
         conn.rollback()
@@ -697,7 +884,8 @@ async def run(args: argparse.Namespace) -> int:
 
     print(
         f"imported {len(users)} users, {len(imported_playlists)} playlists, "
-        f"{len(legacy_downloads)} download rows, {len(download_playlists)} downloaded playlists"
+        f"{len(legacy_downloads)} download rows, {len(download_playlists)} downloaded playlists, "
+        f"{history_inserted} history rows, {starred_inserted} starred tracks"
     )
     print(f"resolution: {resolver.stats}")
     print(f"report: {report_path}")
