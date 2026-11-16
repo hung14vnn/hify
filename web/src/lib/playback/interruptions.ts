@@ -1,0 +1,81 @@
+import { logPlayback } from './debugLog';
+
+/** Safari's Audio Session API (iOS 17+); not in TypeScript's DOM lib yet. */
+type AudioSessionLike = EventTarget & {
+	type: string;
+	readonly state: 'inactive' | 'active' | 'interrupted';
+};
+
+/** A system pause this close before an interruption is treated as part of it. */
+const SYSTEM_PAUSE_WINDOW_MS = 2000;
+
+/**
+ * Phone calls, Siri and alarms take the iOS audio session. WebKit can leave the
+ * element "playing" through a call (the clock runs on with no output) and nothing
+ * resumes it afterwards, so pause for real and resume once the interruption ends.
+ * Does nothing where `navigator.audioSession` is missing (non-Safari, iOS < 17).
+ */
+export class InterruptionGuard {
+	private session: AudioSessionLike | null;
+	private audio: HTMLAudioElement;
+	private resumeAfter = false;
+	private userPausing = false;
+	private systemPausedAt = -Infinity;
+
+	constructor(
+		audio: HTMLAudioElement,
+		private resume: () => void
+	) {
+		this.audio = audio;
+		this.session = (navigator as Navigator & { audioSession?: AudioSessionLike }).audioSession ?? null;
+		if (!this.session) return;
+		try {
+			// Media playback, like a music app: proper interruption handling, ignores the mute switch.
+			this.session.type = 'playback';
+		} catch {
+			/* read-only on some versions */
+		}
+		this.session.addEventListener('statechange', this.onStateChange);
+		this.audio.addEventListener('pause', this.onPause);
+	}
+
+	/** Move interruption tracking to the newly active native audio element. */
+	setAudio(audio: HTMLAudioElement) {
+		if (this.audio === audio) return;
+		this.audio.removeEventListener('pause', this.onPause);
+		this.audio = audio;
+		this.audio.addEventListener('pause', this.onPause);
+	}
+
+	/** Call just before a user-initiated pause so it isn't mistaken for the system's. */
+	userPause() {
+		this.resumeAfter = false;
+		this.userPausing = true;
+	}
+
+	dispose() {
+		this.session?.removeEventListener('statechange', this.onStateChange);
+		this.audio.removeEventListener('pause', this.onPause);
+	}
+
+	private readonly onPause = () => {
+		this.systemPausedAt = this.userPausing ? -Infinity : performance.now();
+		this.userPausing = false;
+	};
+
+	private readonly onStateChange = () => {
+		const state = this.session?.state;
+		logPlayback('audio-session', `${state} paused=${this.audio.paused}`);
+		if (state === 'interrupted' || (!state && this.audio.paused && performance.now() - this.systemPausedAt < SYSTEM_PAUSE_WINDOW_MS)) {
+			// Some versions fire 'pause' themselves just before reporting the interruption.
+			this.resumeAfter = true;
+			if (!this.audio.paused) this.audio.pause();
+		} else if (state === 'active' || (!state && this.resumeAfter)) {
+			if (this.resumeAfter) {
+				this.resumeAfter = false;
+				logPlayback('interruption-resume', 'resuming after audio session restored');
+				this.resume();
+			}
+		}
+	};
+}

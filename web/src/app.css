@@ -1,0 +1,567 @@
+/* SF Pro Display: the same Apple font files the main DroppedNeedle frontend ships
+   (frontend/static/fonts). Bundled via relative URLs so Vite fingerprints them and
+   the build works from any sub-path. */
+@font-face {
+  font-family: "SF Pro Display";
+  src: url("./assets/fonts/SFPRODISPLAYREGULAR.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "SF Pro Display";
+  src: url("./assets/fonts/SFPRODISPLAYMEDIUM.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "SF Pro Display";
+  /* also serves 600/800: the frontend ships no separate semibold/heavy upright */
+  src: url("./assets/fonts/SFPRODISPLAYBOLD.woff2") format("woff2");
+  font-weight: 600 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "SF Pro Display";
+  src: url("./assets/fonts/SFPRODISPLAYSEMIBOLDITALIC.woff2") format("woff2");
+  font-weight: 600;
+  font-style: italic;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light dark;
+  --accent: #fa2d48;
+  --accent-soft: rgb(250 45 72 / 0.25);
+  --bg: #ffffff;
+  --bg-elevated: #ffffff;
+  --sidebar: rgb(246 246 246 / 0.97);
+  --chrome: rgb(250 250 250 / 0.97);
+  --chrome-strong: rgb(248 248 248 / 0.97);
+  --tabbar: rgb(250 250 250 / 0.97);
+  --menu: rgb(246 246 246 / 0.97);
+  --lcd: rgb(0 0 0 / 0.035);
+  --text: #1d1d1f;
+  --text-2: rgb(60 60 67 / 0.62);
+  --text-3: rgb(60 60 67 / 0.34);
+  --hairline: rgb(0 0 0 / 0.13);
+  --fill: rgb(118 118 128 / 0.12);
+  --fill-strong: rgb(118 118 128 / 0.24);
+  --hover: rgb(0 0 0 / 0.045);
+  --selected: rgb(0 0 0 / 0.08);
+  --stripe: rgb(0 0 0 / 0.022);
+  --ph-l1: 90%;
+  --ph-l2: 82%;
+
+  --sidebar-w: 250px;
+  --bar-h: 64px;
+  --gutter: 40px;
+  /* same stack as the main frontend's --font-sans */
+  --font:
+    "SF Pro Display", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* Installed desktop PWA with its title bar hidden (Window Controls Overlay): the
+   app paints up into the title bar, so chrome that reaches the top-right corner
+   reserves this much room for the OS minimise/maximise/close buttons. */
+:root {
+  --wco-inset-right: 0px;
+}
+
+@media (display-mode: window-controls-overlay) {
+  :root {
+    --wco-inset-right: calc(100vw - env(titlebar-area-x, 0px) - env(titlebar-area-width, 100vw));
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #fa586a;
+    --accent-soft: rgb(250 88 106 / 0.3);
+    --bg: #1f1f1f;
+    --bg-elevated: #2c2c2e;
+    --sidebar: rgb(38 38 38 / 0.97);
+    --chrome: rgb(34 34 34 / 0.97);
+    --chrome-strong: rgb(44 44 46 / 0.97);
+    --tabbar: rgb(28 28 30 / 0.97);
+    --menu: rgb(44 44 46 / 0.97);
+    --lcd: rgb(255 255 255 / 0.05);
+    --text: rgb(255 255 255 / 0.92);
+    --text-2: rgb(235 235 245 / 0.6);
+    --text-3: rgb(235 235 245 / 0.32);
+    --hairline: rgb(255 255 255 / 0.12);
+    --fill: rgb(118 118 128 / 0.24);
+    --fill-strong: rgb(118 118 128 / 0.4);
+    --hover: rgb(255 255 255 / 0.06);
+    --selected: rgb(255 255 255 / 0.1);
+    --stripe: rgb(255 255 255 / 0.025);
+    --ph-l1: 28%;
+    --ph-l2: 20%;
+  }
+}
+
+@media (max-width: 899px) {
+  :root {
+    --gutter: 20px;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+  /* App-like: no text selection or iOS long-press callout on UI chrome. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* …but text fields still need to be selectable and editable. */
+input,
+textarea,
+[contenteditable]:not([contenteditable="false"]) {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+}
+
+#app {
+  height: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+img {
+  -webkit-user-drag: none;
+  -webkit-touch-callout: none;
+  user-select: none;
+}
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.explicit {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--bg);
+  background: var(--text-3);
+}
+
+/* ---- page scaffolding --------------------------------------------------- */
+
+.page {
+  padding: 28px 0 48px;
+}
+
+.page-title {
+  margin: 0 var(--gutter) 20px;
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+@media (max-width: 899px) {
+  .page {
+    padding-top: max(16px, env(safe-area-inset-top));
+    /* clear the fixed dock (mini player + tab bar, ~128px) */
+    padding-bottom: calc(76px + env(safe-area-inset-bottom));
+  }
+
+  .page-title {
+    font-size: 34px;
+  }
+
+  .page>.head+.page-title {
+    margin: 0 20px 16px !important;
+    font-size: 28px !important;
+    text-align: left !important;
+  }
+
+  .page>.head {
+    display: flex !important;
+    align-items: center !important;
+    gap: 12px !important;
+    min-height: 24px;
+    padding: 0 10px !important;
+    margin: 0 0 8px !important;
+  }
+
+  .page>.head .back {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 2px;
+    margin: 0 !important;
+    font-size: 14px !important;
+    line-height: 24px;
+    white-space: nowrap;
+  }
+
+  .page>.head .sort {
+    position: relative;
+    display: inline-flex !important;
+    align-items: center;
+    gap: 4px;
+    margin: 0 0 0 auto !important;
+    min-height: 24px;
+    font-size: 14px !important;
+    line-height: 24px;
+    white-space: nowrap;
+  }
+
+  .page>.head .sort select {
+    position: absolute !important;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0 !important;
+  }
+}
+
+.section-title {
+  margin: 0 var(--gutter) 10px;
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 28px 20px;
+  padding: 0 var(--gutter);
+}
+
+.grid.artists {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+}
+
+@media (max-width: 699px) {
+  .grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 20px 14px;
+  }
+
+  .grid.artists {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.pad {
+  padding: 0 var(--gutter);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  min-width: 110px;
+  padding: 0 18px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  transition: filter 0.12s ease;
+}
+
+.btn:hover {
+  filter: brightness(1.08);
+}
+
+.btn.secondary {
+  color: var(--accent);
+  background: var(--fill);
+}
+
+.btn.icon-only {
+  min-width: 34px;
+  width: 34px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--accent);
+  background: var(--fill);
+}
+
+@media (max-width: 699px) {
+  .actions .btn:not(.icon-only) {
+    flex: 1;
+    height: 44px;
+    border-radius: 12px;
+    font-size: 16px;
+    color: var(--accent);
+    background: var(--fill);
+  }
+  /* Match the pill height so the round button sits on the same line. */
+  .actions .btn.icon-only {
+    width: 44px;
+    min-width: 44px;
+    height: 44px;
+  }
+}
+
+.muted {
+  color: var(--text-2);
+}
+
+.empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 80px var(--gutter);
+  text-align: center;
+  color: var(--text-2);
+}
+
+.empty-state h3 {
+  margin: 0;
+  font-size: 22px;
+  color: var(--text);
+}
+
+.skeleton {
+  border-radius: 8px;
+  background: linear-gradient(90deg,
+      var(--fill) 0%,
+      var(--hover) 50%,
+      var(--fill) 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+@keyframes shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  margin: 40px auto;
+  border-radius: 50%;
+  border: 2.5px solid var(--fill-strong);
+  border-top-color: var(--text-2);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---- motion ------------------------------------------------------------- */
+
+.icon-swap {
+  display: grid;
+  place-items: center;
+}
+
+/* Press feedback on tappable controls. */
+button:not(:disabled),
+a.tile,
+.card .cover {
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    opacity 0.18s ease,
+    filter 0.18s ease;
+}
+
+button:not(:disabled):active,
+.card .cover:active,
+a.tile:active {
+  opacity: 0.75;
+}
+
+/* Staggered reveal for grids, shelves and track lists on first paint. */
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.985);
+  }
+}
+
+.grid>*,
+.shelf .row>*,
+.tracks>.row {
+  animation: reveal 0.45s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+/* A page restored by going back reappears exactly as it was left: replaying the
+   reveal would make all its content shift up under the restored scroll position. */
+.view.restored .grid>*,
+.view.restored .shelf .row>*,
+.view.restored .tracks>.row {
+  animation: none;
+}
+
+.grid> :nth-child(2),
+.shelf .row> :nth-child(2),
+.tracks>.row:nth-child(2) {
+  animation-delay: 30ms;
+}
+
+.grid> :nth-child(3),
+.shelf .row> :nth-child(3),
+.tracks>.row:nth-child(3) {
+  animation-delay: 60ms;
+}
+
+.grid> :nth-child(4),
+.shelf .row> :nth-child(4),
+.tracks>.row:nth-child(4) {
+  animation-delay: 90ms;
+}
+
+.grid> :nth-child(5),
+.shelf .row> :nth-child(5),
+.tracks>.row:nth-child(5) {
+  animation-delay: 120ms;
+}
+
+.grid> :nth-child(6),
+.shelf .row> :nth-child(6),
+.tracks>.row:nth-child(6) {
+  animation-delay: 150ms;
+}
+
+.grid> :nth-child(7),
+.shelf .row> :nth-child(7),
+.tracks>.row:nth-child(7) {
+  animation-delay: 180ms;
+}
+
+.grid> :nth-child(n + 8),
+.shelf .row> :nth-child(n + 8),
+.tracks>.row:nth-child(n + 8) {
+  animation-delay: 210ms;
+}
+
+/* Spinners only appear if loading takes a noticeable moment (no flash). */
+.spinner {
+  animation:
+    spin 0.8s linear infinite,
+    reveal-late 0.2s ease 0.35s both;
+}
+
+/* Play/pause button while the track loads: a ring spins around it. */
+.has-ring {
+  position: relative;
+}
+
+.loading-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: currentColor;
+  pointer-events: none;
+  animation:
+    spin 0.8s linear infinite,
+    reveal-late 0.2s ease 0.35s both;
+}
+
+@keyframes reveal-late {
+  from {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ---- scrollbars --------------------------------------------------------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--fill-strong) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background-color: transparent;
+}
+
+::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--fill-strong);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-3);
+}

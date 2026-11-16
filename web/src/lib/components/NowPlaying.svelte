@@ -1,0 +1,2344 @@
+<script lang="ts">
+	// Full-screen player modelled on iOS 18 Music: artwork-tinted gradient backdrop,
+	// large art near the top that shrinks while paused, and a three-button footer
+	// (lyrics · output device · queue). Lyrics/queue sit beside the art on desktop
+	// and replace it on phones.
+	import { tick } from "svelte";
+	import { cubicOut } from "svelte/easing";
+	import { time } from "../format";
+	import { toggleKaraoke } from "../karaoke";
+	import { songMenu } from "../menus";
+	import type { TransitionConfig } from "svelte/transition";
+	import { artSwap, fadeOnly, pop, sheet, textSwap } from "../motion";
+	import { coverUrl, getPlaybackQuality, setPlaybackQuality, type PlaybackQuality } from "../api";
+	import { artworkTint, type Tint } from "../palette";
+	import { getPlayer } from "../player.svelte";
+	import { sleepTimer } from "../sleepTimer.svelte";
+	import { audioSettings } from "../playback/audioSettings.svelte";
+	import { ui } from "../ui.svelte";
+	import Artwork from "./Artwork.svelte";
+	import ArtistLinks from "./ArtistLinks.svelte";
+	import Icon from "./Icon.svelte";
+	import Lyrics from "./Lyrics.svelte";
+	import Queue from "./Queue.svelte";
+	import Slider from "./Slider.svelte";
+
+	const player = getPlayer();
+	const song = $derived(player.current);
+	const nextSong = $derived(player.nextSong);
+	let scrub = $state<number | null>(null);
+	const shownTime = $derived(scrub ?? player.currentTime);
+	// Whole seconds: the bar moves ~1px/s, so repainting on every timeupdate (~4/s) is wasted.
+	const progressTime = $derived(Math.floor(player.currentTime));
+
+	const trackDuration = $derived(player.duration || song?.duration || 0);
+	// Round to whole seconds so the time strings are not re-formatted every millisecond.
+	const formattedCurrentTime = $derived(time(Math.floor(shownTime)));
+	const formattedRemainingTime = $derived(
+		time(Math.max(0, Math.floor(trackDuration - shownTime))),
+	);
+
+	interface DisplayTrack {
+		id: string;
+		coverArt?: string;
+		title?: string;
+		artist?: string;
+		album?: string;
+		tint: Tint | null;
+	}
+
+	let currentDisplay = $state<DisplayTrack | null>(null);
+	let incomingDisplay = $state<DisplayTrack | null>(null);
+	let incomingActive = $state(false);
+
+	let tint: Tint | null = $state(null);
+	let nextTint: Tint | null = $state(null);
+	let npHeight = $state(0);
+	let controlsVisible = $state(true);
+	/** Set by close(): the backdrop must not fade out underneath the morph. */
+	let closing = false;
+	let controlsTimer: ReturnType<typeof setTimeout> | undefined;
+	let wakeLock: WakeLockSentinel | null = null;
+
+	$effect(() => {
+		const art = song?.coverArt;
+		let cancelled = false;
+		Promise.resolve(artworkTint(art)).then((t) => {
+			if (!cancelled) {
+				tint = t;
+				if (currentDisplay && currentDisplay.id === song?.id) {
+					currentDisplay.tint = t;
+				}
+			}
+		});
+		return () => (cancelled = true);
+	});
+
+	$effect(() => {
+		const art = nextSong?.coverArt;
+		let cancelled = false;
+		if (art) {
+			Promise.resolve(artworkTint(art)).then((t) => {
+				if (!cancelled) {
+					nextTint = t;
+					if (incomingDisplay && incomingDisplay.id === nextSong?.id) {
+						incomingDisplay.tint = t;
+					}
+				}
+			});
+		} else {
+			nextTint = null;
+		}
+		return () => (cancelled = true);
+	});
+
+	// Smooth track transition management
+	$effect(() => {
+		const cur = song;
+		if (!cur) {
+			currentDisplay = null;
+			incomingDisplay = null;
+			return;
+		}
+
+		if (!currentDisplay || cur.id !== currentDisplay.id) {
+			if (incomingDisplay && incomingDisplay.id === cur.id) {
+				// Seamless handoff from audio crossfade
+				currentDisplay = incomingDisplay;
+				incomingDisplay = null;
+				incomingActive = false;
+			} else {
+				// Smooth cross-dissolve & artSwap transition triggered via key
+				currentDisplay = {
+					id: cur.id,
+					coverArt: cur.coverArt,
+					title: cur.title,
+					artist: cur.artist,
+					album: cur.album,
+					tint
+				};
+			}
+		}
+	});
+
+	// Audio crossfade reactive controller
+	$effect(() => {
+		const isCf = player.crossfading;
+		const nxt = player.nextSong;
+
+		if (isCf && nxt) {
+			incomingDisplay = {
+				id: nxt.id,
+				coverArt: nxt.coverArt,
+				title: nxt.title,
+				artist: nxt.artist,
+				album: nxt.album,
+				tint: nextTint
+			};
+			requestAnimationFrame(() => {
+				requestAnimationFrame(() => {
+					incomingActive = true;
+				});
+			});
+		} else if (!isCf && incomingDisplay) {
+			if (incomingDisplay.id !== song?.id) {
+				incomingActive = false;
+				const timer = setTimeout(() => {
+					if (!player.crossfading) {
+						incomingDisplay = null;
+					}
+				}, 500);
+				return () => clearTimeout(timer);
+			}
+		}
+	});
+
+	const displayTint = $derived(
+		incomingActive && incomingDisplay?.tint
+			? incomingDisplay.tint
+			: currentDisplay?.tint ?? tint
+	);
+
+	const LOSSLESS = new Set([
+		"flac",
+		"alac",
+		"wav",
+		"aiff",
+		"aif",
+		"ape",
+		"wv",
+	]);
+	const quality = $derived.by(() => {
+		const s = song?.suffix?.toLowerCase();
+		if (!s) return "";
+		if (LOSSLESS.has(s)) return "Lossless";
+		return song?.bitRate
+			? `${s.toUpperCase()} · ${song.bitRate} kbps`
+			: s.toUpperCase();
+	});
+
+	const qualityBadgeLabel = $derived.by(() => {
+		const s = song?.suffix?.toLowerCase();
+		if (!s) return "";
+		if (LOSSLESS.has(s)) {
+			const hiRes =
+				(song?.bitDepth ?? 0) > 16 ||
+				(song?.sampleRate ?? 0) > 48_000 ||
+				(song?.bitRate ?? 0) > 1500;
+			return hiRes ? "Hi-Res Lossless" : "Lossless";
+		}
+		const codec = s === "webm" || s === "opus" ? "Opus" : s === "m4a" ? "AAC" : s.toUpperCase();
+		return song?.bitRate ? `${codec} · ${song.bitRate} kbps` : codec;
+	});
+
+	let showAudioSpecs = $state(false);
+	let playbackQuality = $state<PlaybackQuality | null>(null);
+	let qualityBusy = $state(false);
+	const QUALITY_OPTIONS: { value: PlaybackQuality; label: string; detail: string }[] = [
+		{ value: "HI_RES_LOSSLESS", label: "Hi-Res Lossless", detail: "Up to 24-bit / 192 kHz" },
+		{ value: "LOSSLESS", label: "Lossless", detail: "CD · 16-bit / 44.1 kHz" },
+		{ value: "HIGH", label: "High", detail: "Lossy · lighter on data" }
+	];
+
+	getPlaybackQuality()
+		.then((value) => (playbackQuality = value))
+		.catch(() => {});
+
+	async function chooseQuality(value: PlaybackQuality) {
+		if (qualityBusy || playbackQuality === value) return;
+		qualityBusy = true;
+		try {
+			playbackQuality = await setPlaybackQuality(value);
+			const label = QUALITY_OPTIONS.find((option) => option.value === value)?.label ?? value;
+			ui.showToast(`Playback quality: ${label}`);
+			player.reloadCurrent();
+		} catch {
+			ui.showToast("Couldn’t change playback quality");
+		} finally {
+			qualityBusy = false;
+		}
+	}
+
+	const sampleRateLabel = $derived.by(() => {
+		const sr = player.sampleRate ?? 44100;
+		return `${(sr / 1000).toFixed(1)} kHz`;
+	});
+
+	const bitDepthLabel = $derived.by(() => {
+		const s = song?.suffix?.toLowerCase() ?? "";
+		if (LOSSLESS.has(s)) {
+			return song?.bitRate && song.bitRate > 1500 ? "24-bit" : "16-bit";
+		}
+		return "16-bit";
+	});
+
+	const replayGainLabel = $derived.by(() => {
+		const g = song?.replayGain?.trackGain;
+		if (typeof g === "number") return `${g > 0 ? "+" : ""}${g.toFixed(1)} dB`;
+		return audioSettings.soundCheck ? "0.0 dB (Check on)" : "Off";
+	});
+
+	const outputLabel = $derived(
+		player.castStalled
+			? "Not responding"
+			: player.castState === "connected"
+				? "Casting"
+				: player.castState === "connecting"
+					? "Connecting…"
+					: "This Device",
+	);
+
+	function showControls() {
+		controlsVisible = true;
+		if (!isMobile || ui.panel !== "lyrics" || !player.playing) return;
+		clearTimeout(controlsTimer);
+		controlsTimer = setTimeout(() => (controlsVisible = false), 5000);
+	}
+
+	function onPointerDown(e: PointerEvent) {
+		if (
+			e.target instanceof Element &&
+			e.target.closest(".panel, .show-controls")
+		)
+			return;
+		showControls();
+	}
+
+	async function releaseWakeLock() {
+		if (!wakeLock) return;
+		await wakeLock.release();
+		wakeLock = null;
+	}
+
+	async function requestWakeLock() {
+		const wakeLockApi = (
+			navigator as Navigator & {
+				wakeLock?: { request(type: "screen"): Promise<WakeLockSentinel> };
+			}
+		).wakeLock;
+		if (!wakeLockApi || wakeLock) return;
+		try {
+			wakeLock = await wakeLockApi.request("screen");
+		} catch {
+			// Screen wake lock is optional and may be denied by the browser.
+		}
+	}
+
+	$effect(() => {
+		if (ui.panel !== "lyrics") {
+			clearTimeout(controlsTimer);
+			controlsVisible = true;
+			void releaseWakeLock();
+			return;
+		}
+
+		showControls();
+		// Keep the screen on only while music is actually playing: a paused song
+		// with lyrics open should let the display sleep.
+		if (!player.playing) {
+			void releaseWakeLock();
+			return;
+		}
+		const onVisibilityChange = () => {
+			if (document.visibilityState === "visible") void requestWakeLock();
+		};
+		document.addEventListener("visibilitychange", onVisibilityChange);
+		void requestWakeLock();
+
+		return () => {
+			clearTimeout(controlsTimer);
+			document.removeEventListener("visibilitychange", onVisibilityChange);
+			void releaseWakeLock();
+		};
+	});
+
+	$effect(() => {
+		if (!isMobile || player.playing) {
+			if (ui.panel === "lyrics") showControls();
+			return;
+		}
+
+		clearTimeout(controlsTimer);
+		controlsVisible = true;
+	});
+
+	// A stuck AirPlay/Cast hand-off keeps the clock running with no sound; say why.
+	$effect(() => {
+		if (player.castStalled)
+			ui.showToast(
+				"Playback device isn’t responding — tap the output button to switch back",
+			);
+	});
+
+	async function pickOutput() {
+		if (!(await player.pickOutput()))
+			ui.showToast("No other playback devices found");
+	}
+
+	// ---- mobile panel + FLIP ---------------------------------------------------
+	// Track the mobile breakpoint (matches the 900px CSS media query).
+	let isMobile = $state(false);
+	type Panel = "lyrics" | "queue";
+	// Single source of truth: is a panel open on mobile?
+	const mobileOpen = $derived(isMobile && !!ui.panel);
+
+	let mainEl = $state<HTMLDivElement | null>(null);
+	let panelEl = $state<HTMLDivElement | null>(null);
+	let leaveBox: {
+		top: number;
+		left: number;
+		width: number;
+		height: number;
+	} | null = null;
+
+	$effect(() => {
+		const mq = window.matchMedia("(max-width: 899px)");
+		const update = () => (isMobile = mq.matches);
+		update();
+		mq.addEventListener("change", update);
+		return () => mq.removeEventListener("change", update);
+	});
+
+	// Panel only uses opacity + transform, never touches layout.
+	function panelIn(_node: HTMLElement, { duration = 500 } = {}) {
+		return {
+			duration,
+			easing: cubicOut,
+			css: (t: number) =>
+				`opacity:${t};transform:translateY(${(1 - t) * 16}px)`,
+		};
+	}
+
+	// On leave: pull the panel out of the flow (absolute, keeping its old box) so the
+	// new layout applies immediately and FLIP can animate the rest.
+	function panelOut(node: HTMLElement, { duration = 350 } = {}) {
+		if (leaveBox) {
+			Object.assign(node.style, {
+				position: "absolute",
+				top: `${leaveBox.top}px`,
+				left: `${leaveBox.left}px`,
+				width: `${leaveBox.width}px`,
+				height: `${leaveBox.height}px`,
+				margin: "0",
+				pointerEvents: "none",
+			});
+		}
+		return {
+			duration,
+			easing: cubicOut,
+			css: (t: number) =>
+				`opacity:${t};transform:translateY(${(1 - t) * 14}px)`,
+		};
+	}
+
+	const FLIP_EASING = "cubic-bezier(0.2, 0.8, 0.2, 1)";
+
+	async function flip(mutate: () => void) {
+		if (!mainEl) return mutate();
+
+		const els = () =>
+			Array.from(mainEl!.querySelectorAll<HTMLElement>("[data-flip]"));
+
+		// FIRST: measure (works even if a previous animation is mid-flight)
+		const first = new Map(
+			els().map((el) => [el.dataset.flip!, el.getBoundingClientRect()]),
+		);
+		const m = mainEl.getBoundingClientRect();
+		const p = panelEl?.getBoundingClientRect();
+		leaveBox = p
+			? {
+					top: p.top - m.top,
+					left: p.left - m.left,
+					width: p.width,
+					height: p.height,
+				}
+			: null;
+
+		mutate();
+		await tick();
+		leaveBox = null;
+
+		// Cancel old animations before measuring LAST so we get the true final position
+		const rows = els();
+		rows.forEach((el) => el.getAnimations().forEach((a) => a.cancel()));
+
+		for (const el of rows) {
+			const before = first.get(el.dataset.flip!);
+			if (!before) continue;
+			const after = el.getBoundingClientRect();
+			const dx = before.left - after.left;
+			const dy = before.top - after.top;
+			const sx = after.width ? before.width / after.width : 1;
+			const sy = after.height ? before.height / after.height : 1;
+			if (
+				Math.abs(dx) < 0.5 &&
+				Math.abs(dy) < 0.5 &&
+				Math.abs(sx - 1) < 0.005 &&
+				Math.abs(sy - 1) < 0.005
+			)
+				continue;
+
+			el.animate(
+				[
+					{
+						transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
+					},
+					{ transform: "translate3d(0, 0, 0) scale(1, 1)" },
+				],
+				{ duration: 550, easing: FLIP_EASING },
+			);
+		}
+	}
+
+	function toggleMobilePanel(panel: Panel) {
+		if (!isMobile) return ui.togglePanel(panel);
+		flip(() => ui.togglePanel(panel));
+	}
+
+	// Swipe-down-to-dismiss from anywhere in the Now Playing screen.
+	let startY = 0;
+	let dragY = $state(0);
+	let dismissGesture = false;
+
+	function onTouchStart(e: TouchEvent) {
+		// Queue/Lyrics own their touch gestures. Do not let a scroll that bubbles
+		// from the panel move or dismiss the Now Playing sheet.
+		dismissGesture = !(
+			e.target instanceof Element && e.target.closest(".panel, .slider")
+		);
+		if (dismissGesture) startY = e.touches[0].clientY;
+	}
+
+	function onTouchMove(e: TouchEvent) {
+		if (dismissGesture) dragY = Math.max(0, e.touches[0].clientY - startY);
+	}
+
+	function onTouchEnd() {
+		if (dismissGesture) dragY > 110 ? close() : (dragY = 0);
+		dismissGesture = false;
+	}
+
+	function close() {
+		closing = true;
+		ui.closeNowPlaying();
+	}
+
+	/** The backdrop fades between tracks, but never while the sheet closes. */
+	function backdropOut(node: Element, opts?: { duration?: number }) {
+		return fadeOnly(node, { duration: closing ? 0 : (opts?.duration ?? 450) });
+	}
+
+	// ---- open/close morph ------------------------------------------------------
+	// On phones the sheet grows out of the floating mini player and shrinks back
+	// into it: the visible area is clipped from the mini pill's box to the full
+	// screen, while the artwork, title/artist and play/next buttons fly between
+	// their mini and full positions, and everything else fades in on top.
+	// Desktop (no mini player) keeps the slide-up sheet. It all runs through the
+	// Web Animations API, mostly transform/opacity (compositor) plus the one
+	// clip-path, so a busy main thread while the sheet mounts can't stall it.
+	// The curve is gentler than the dock's so the pill visibly grows instead of
+	// jumping most of the way in the first frames.
+	const MORPH_EASE = "cubic-bezier(0.3, 0.7, 0.2, 1)";
+	// Title/artist are not in this list: they fly from the mini player instead.
+	const MORPH_FADE =
+		".grab, .info .round, .progress, .transport .skip:first-child, .volume, .bottom, .panel, .nothing, .art-row.mini .meta-btn";
+	// Mini player text → its Now Playing counterpart (full layout, or compact
+	// row when a panel is open on mobile).
+	// Mini player buttons → their Now Playing counterparts.
+	const MORPH_BUTTONS = [
+		{ from: "[data-np-play]", to: ".transport .pp" },
+		{ from: "[data-np-next]", to: ".transport .skip:last-child" },
+	];
+	const MORPH_TEXT = [
+		{ from: "[data-np-title]", to: ".info .title, .art-row.mini .c-title" },
+		{ from: "[data-np-artist]", to: ".info .artist, .art-row.mini .c-artist" },
+	];
+	let morphAnims: Animation[] = [];
+	/** Direction the current animations' keyframes were built for. */
+	let morphBuiltFor: "in" | "out" = "in";
+	/** Direction the sheet is heading now (changes when reversed mid-flight). */
+	let morphDir: "in" | "out" = "in";
+
+	// Returns a deferred config: Svelte calls it on every start *and* reversal with
+	// the current direction, so open↔close interruptions can be handled here.
+	function morph(node: HTMLElement) {
+		// (Svelte's types declare no argument, but the runtime passes `{ direction }`.)
+		return (opts?: { direction?: "in" | "out" }): TransitionConfig => {
+			const dir = opts?.direction === "out" ? "out" : "in";
+			const duration = dir === "out" ? 480 : 620;
+			morphDir = dir;
+			// The outward morph must not keep the tinted sheet over the pill: switch
+			// the sheet to the mini player's default colour from its first frame.
+			if (dir === "out") node.classList.add("closing");
+
+			// Reversed mid-flight: turn the running animations around so they continue
+			// from where they are and land when Svelte's (shortened) timer does.
+			if (morphAnims.some((a) => a.playState === "running")) {
+				for (const a of morphAnims) {
+					const own = Number(a.effect?.getTiming().duration) || duration;
+					a.playbackRate = ((dir === morphBuiltFor ? 1 : -1) * own) / duration;
+				}
+				return { duration };
+			}
+			morphAnims.forEach((a) => a.cancel());
+			morphAnims = [];
+			morphBuiltFor = dir;
+
+			const anchorEl = document.querySelector<HTMLElement>("[data-np-anchor]");
+			const anchor = anchorEl?.getBoundingClientRect();
+			if (
+				!anchor?.width ||
+				matchMedia("(prefers-reduced-motion: reduce)").matches
+			)
+				return sheet(node, { offset: dragY });
+
+			// Frames are written for opening; closing plays them backwards on the same curve.
+			const play = (el: Element, frames: Keyframe[]) => {
+				const keyframes =
+					dir === "out"
+						? frames
+								.map((f) => ({ ...f, offset: 1 - (f.offset as number) }))
+								.reverse()
+						: frames;
+				const anim = el.animate(keyframes, {
+					duration,
+					easing: MORPH_EASE,
+					fill: "both",
+				});
+				// Once fully open, hand the elements back to their normal styles.
+				// (Fully closed needs nothing: Svelte removes the sheet.)
+				anim.onfinish = () => {
+					if (morphDir !== "in") return;
+					morphAnims.forEach((a) => a.cancel());
+					morphAnims = [];
+				};
+				morphAnims.push(anim);
+			};
+
+			// Measured against the sheet's own box so a swipe-down offset is respected.
+			const box = node.getBoundingClientRect();
+			const inset = [
+				anchor.top - box.top,
+				box.right - anchor.right,
+				box.bottom - anchor.bottom,
+				anchor.left - box.left,
+			];
+
+			// Artwork: the cover flies between the mini player's thumbnail and the
+			// hero box, so both directions read as the same image moving.
+			const hero = node.querySelector<HTMLElement>(".backdrop-art");
+			const from = document
+				.querySelector<HTMLElement>("[data-np-art]")
+				?.getBoundingClientRect();
+			if (hero && from?.width) {
+				const to = hero.getBoundingClientRect();
+				if (to.width > 1 && to.height > 1) {
+					const sx = from.width / to.width;
+					const sy = from.height / to.height;
+					const dx = from.left - to.left;
+					const dy = from.top - to.top;
+					play(hero, [
+						{
+							offset: 0,
+							transformOrigin: "0 0",
+							transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
+						},
+						{
+							offset: 1,
+							transformOrigin: "0 0",
+							transform: "translate3d(0, 0, 0) scale(1, 1)",
+						},
+					]);
+				}
+			}
+
+			// The sheet starts as a solid copy of the mini pill (same box, radius and
+			// colour) and grows to full screen; the tinted backdrop fades in over it.
+			// Title and artist: move and scale (by font size) from the mini player's
+			// text onto the big text, so they read as the same line.
+			// The title's flight, so a line with no visible source (the artist, hidden
+			// in the compact dock) can ride along under it instead of being crossed.
+			let lead: { dx: number; dy: number; s: number; box: DOMRect } | null = null;
+			for (const pair of MORPH_TEXT) {
+				const source = document.querySelector<HTMLElement>(pair.from);
+				const target = node.querySelector<HTMLElement>(pair.to);
+				if (!target) continue;
+				const a = source?.getBoundingClientRect();
+				const visible =
+					source && a?.height && getComputedStyle(source).opacity !== "0";
+				const t = target.getBoundingClientRect();
+				if (!visible) {
+					if (!lead) {
+						play(target, [
+							{ offset: 0, opacity: 0 },
+							{ offset: 0.55, opacity: 0 },
+							{ offset: 1, opacity: 1 },
+						]);
+						continue;
+					}
+					// Same transform as the title, re-based on this element's origin so
+					// both move as one block (d = d_lead + (s - 1)(origin - lead origin)).
+					const gx = lead.dx + (lead.s - 1) * (t.left - lead.box.left);
+					const gy = lead.dy + (lead.s - 1) * (t.top - lead.box.top);
+					play(target, [
+						{
+							offset: 0,
+							opacity: 0,
+							transformOrigin: "0 0",
+							transform: `translate3d(${gx}px, ${gy}px, 0) scale(${lead.s})`,
+						},
+						{ offset: 0.3, opacity: 0 },
+						{
+							offset: 1,
+							opacity: 1,
+							transformOrigin: "0 0",
+							transform: "translate3d(0, 0, 0) scale(1)",
+						},
+					]);
+					continue;
+				}
+				const s =
+					parseFloat(getComputedStyle(source).fontSize) /
+					parseFloat(getComputedStyle(target).fontSize);
+				const dx = a.left - t.left;
+				const dy = a.top + a.height / 2 - (t.top + (t.height * s) / 2);
+				lead ??= { dx, dy, s, box: t };
+				// Fully visible from the first frame (it sits exactly over the mini text the
+				// pill just covered) and recoloured from the mini's colour to its own.
+				const fromColor = getComputedStyle(source).color;
+				const toColor = getComputedStyle(target).color;
+				// Typography (weight, letter spacing): closing uses the mini's from the
+				// very first frame, so the line doesn't change weight or width when the
+				// real mini text takes over; opening switches to its own once, halfway
+				// (either change re-lays out the text, so it isn't interpolated).
+				// The mini's spacing is converted to this element's (scaled) units.
+				const src = getComputedStyle(source);
+				const tgt = getComputedStyle(target);
+				const spacing = (cs: CSSStyleDeclaration) =>
+					cs.letterSpacing === "normal" ? 0 : parseFloat(cs.letterSpacing) || 0;
+				const fromType = {
+					fontWeight: src.fontWeight,
+					letterSpacing: `${spacing(src) / s}px`,
+				};
+				const toType = { fontWeight: tgt.fontWeight, letterSpacing: `${spacing(tgt)}px` };
+				if (
+					fromType.fontWeight !== toType.fontWeight ||
+					fromType.letterSpacing !== toType.letterSpacing
+				) {
+					const end = dir === "out" ? fromType : toType;
+					play(target, [
+						{ offset: 0, ...fromType, easing: "step-end" },
+						{ offset: 0.5, ...end },
+						{ offset: 1, ...end },
+					]);
+				}
+				// Transform in its own animation (compositor); colour separately and
+				// only when the two differ (light theme).
+				play(target, [
+					{ offset: 0, transformOrigin: "0 0", transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})` },
+					{ offset: 1, transformOrigin: "0 0", transform: "translate3d(0, 0, 0) scale(1)" },
+				]);
+				if (fromColor !== toColor)
+					play(target, [
+						{ offset: 0, color: fromColor },
+						{ offset: 0.5, color: toColor },
+						{ offset: 1, color: toColor },
+					]);
+			}
+
+			// Keep the sheet's top corners rounded throughout the grow. The final
+			// clip must match .np too, otherwise the radius only appears after the
+			// Web Animation hands control back to CSS. The background colour is left
+			// alone: the Now Playing tint must not flip to the mini player's default.
+			const clip = (p: number, r: number) =>
+				`inset(${inset.map((v) => `${v * (1 - p)}px`).join(" ")} round ${r}px)`;
+			const radius = anchor.height / 2;
+			play(node, [
+				{ offset: 0, clipPath: clip(0, radius) },
+				{ offset: 0.8, clipPath: clip(0.8, radius) },
+				{ offset: 1, clipPath: "inset(0 round 28px 28px 0 0)" },
+			]);
+
+			// Play/pause and next fly onto the mini player's buttons (scaled by icon
+			// size, recoloured), like the title does, so the mini's own buttons simply
+			// take over when the sheet is removed. A button with no visible
+			// counterpart (next, in the compact dock) just fades.
+			for (const pair of MORPH_BUTTONS) {
+				const target = node.querySelector<HTMLElement>(pair.to);
+				if (!target) continue;
+				const source = document.querySelector<HTMLElement>(pair.from);
+				const a = source?.querySelector("svg")?.getBoundingClientRect();
+				const b = target.querySelector("svg")?.getBoundingClientRect();
+				if (!source || !a?.width || !b?.width || getComputedStyle(source).opacity === "0") {
+					play(target, [
+						{ offset: 0, opacity: 0 },
+						{ offset: 0.55, opacity: 0 },
+						{ offset: 1, opacity: 1 },
+					]);
+					continue;
+				}
+				const s = a.width / b.width;
+				const dx = a.left + a.width / 2 - (b.left + b.width / 2);
+				const dy = a.top + a.height / 2 - (b.top + b.height / 2);
+				// Scale about the icon's centre, wherever it sits in the button.
+				const t = target.getBoundingClientRect();
+				const origin = `${b.left + b.width / 2 - t.left}px ${b.top + b.height / 2 - t.top}px`;
+				// Transform only, so this stays a compositor animation.
+				play(target, [
+					{ offset: 0, transformOrigin: origin, transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})` },
+					{ offset: 1, transformOrigin: origin, transform: "translate3d(0, 0, 0) scale(1)" },
+				]);
+				// Colour (a repaint) separately, on the icon, and only when it differs
+				// (light theme); in dark mode both are white and nothing runs.
+				const fromColor = getComputedStyle(source).color;
+				const toColor = getComputedStyle(target).color;
+				const icon = target.querySelector("svg");
+				if (icon && fromColor !== toColor)
+					play(icon, [
+						{ offset: 0, color: fromColor },
+						{ offset: 0.5, color: toColor },
+						{ offset: 1, color: toColor },
+					]);
+			}
+
+			const backdrop = node.querySelector(".backdrop");
+			if (backdrop) {
+				// Keep the artwork visible throughout: the sheet clip (and the hero
+				// art flight) carry the transition, never a plain fade.
+				play(backdrop, [
+					{ offset: 0, opacity: 1 },
+					{ offset: 1, opacity: 1 },
+				]);
+			}
+			for (const el of node.querySelectorAll(MORPH_FADE))
+				play(el, [
+					{ offset: 0, opacity: 0 },
+					{ offset: 0.55, opacity: 0 },
+					{ offset: 1, opacity: 1 },
+				]);
+
+			// Svelte only needs the length (to keep the node mounted while closing).
+			return { duration };
+		};
+	}
+
+	function onKey(e: KeyboardEvent) {
+		if (e.key === "Escape") close();
+	}
+</script>
+
+<svelte:window onkeydown={onKey} />
+
+<div
+	transition:morph
+	class="np"
+	class:tinted={!!displayTint}
+	class:closing={!ui.nowPlaying}
+	style:--np-top={displayTint?.top}
+	style:--np-bottom={displayTint?.bottom}
+	style:--np-h="{npHeight}px"
+	bind:clientHeight={npHeight}
+	style:transform={dragY ? `translateY(${dragY}px)` : undefined}
+	style:transition={dragY && ui.nowPlaying ? "none" : undefined}
+	ontouchstart={onTouchStart}
+	ontouchmove={onTouchMove}
+	ontouchend={onTouchEnd}
+	ontouchcancel={onTouchEnd}
+	onpointerdown={onPointerDown}
+	role="dialog"
+	tabindex="-1"
+	aria-modal="true"
+	aria-label="Now Playing"
+>
+	<div class="backdrop" aria-hidden="true">
+		{#if currentDisplay}
+			{#key currentDisplay.id}
+				<div class="backdrop-layer active" out:backdropOut={{ duration: 450 }}>
+					<img
+						class="backdrop-art"
+						src={coverUrl(currentDisplay.coverArt, 1200)}
+						alt=""
+						draggable="false"
+					/>
+					{#if currentDisplay.tint}
+						<div
+							class="tint"
+							style:--top={currentDisplay.tint.top}
+							style:--bottom={currentDisplay.tint.bottom}
+							style:--accent={currentDisplay.tint.accent ?? currentDisplay.tint.top}
+							style:--glow={currentDisplay.tint.glow ?? 'transparent'}
+						>
+							<div class="mesh-aura" class:paused={!player.playing} aria-hidden="true"></div>
+						</div>
+					{/if}
+				</div>
+			{/key}
+		{/if}
+
+		{#if incomingDisplay}
+			<div class="backdrop-layer incoming" class:fading-in={incomingActive}>
+				<img
+					class="backdrop-art"
+					src={coverUrl(incomingDisplay.coverArt, 1200)}
+					alt=""
+					draggable="false"
+				/>
+				{#if incomingDisplay.tint}
+					<div
+						class="tint"
+						style:--top={incomingDisplay.tint.top}
+						style:--bottom={incomingDisplay.tint.bottom}
+						style:--accent={incomingDisplay.tint.accent ?? incomingDisplay.tint.top}
+						style:--glow={incomingDisplay.tint.glow ?? 'transparent'}
+					>
+						<div class="mesh-aura" class:paused={!player.playing} aria-hidden="true"></div>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+
+	<div class="panel-veil" class:visible={mobileOpen} aria-hidden="true"></div>
+
+	<div class="grab" role="presentation">
+		<button class="dismiss" aria-label="Close Now Playing" onclick={close}>
+			<span class="pill"></span>
+			<Icon name="chevronDown" size={26} />
+		</button>
+	</div>
+
+	{#if showAudioSpecs && song}
+		<div
+			class="specs-overlay"
+			onclick={() => (showAudioSpecs = false)}
+			in:fadeOnly={{ duration: 180 }}
+			out:fadeOnly={{ duration: 150 }}
+			role="presentation"
+		>
+			<div
+				class="specs-sheet"
+				tabindex="-1"
+				role="dialog"
+				aria-modal="true"
+				aria-label="Audio Technical Specs"
+				onclick={(e) => e.stopPropagation()}
+				onkeydown={(e) => {
+					if (e.key === "Escape") showAudioSpecs = false;
+				}}
+				in:pop={{ from: 0.92, duration: 220 }}
+				out:pop={{ from: 0.92, duration: 160 }}
+			>
+				<header class="specs-header">
+					<div class="specs-title-row">
+						<span class="specs-badge">{quality || "Audio"}</span>
+						<h3>Audio Technical Specs</h3>
+					</div>
+					<button
+						class="specs-close"
+						onclick={() => (showAudioSpecs = false)}
+						aria-label="Close audio details"
+					>
+						<Icon name="close" size={16} />
+					</button>
+				</header>
+
+				<div class="quality-pick">
+					<span class="spec-label">Playback quality</span>
+					<div class="quality-options">
+						{#each QUALITY_OPTIONS as option (option.value)}
+							<button
+								class:on={playbackQuality === option.value}
+								disabled={qualityBusy}
+								aria-pressed={playbackQuality === option.value}
+								onclick={() => chooseQuality(option.value)}
+							>
+								<span class="quality-label">{option.label}</span>
+								<small>{option.detail}</small>
+							</button>
+						{/each}
+					</div>
+				</div>
+
+				<div class="specs-grid">
+					<div class="spec-card">
+						<span class="spec-label">Format / Codec</span>
+						<span class="spec-val highlight">{(song.suffix ?? "N/A").toUpperCase()}</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Bitrate</span>
+						<span class="spec-val">
+							{song.bitRate
+								? `${song.bitRate} kbps`
+								: (LOSSLESS.has(song.suffix?.toLowerCase() ?? '') ? 'Lossless VBR' : 'Standard')}
+						</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Sample Rate</span>
+						<span class="spec-val">{sampleRateLabel}</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Bit Depth</span>
+						<span class="spec-val">{bitDepthLabel}</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Audio Engine</span>
+						<span class="spec-val">{player.webAudio ? "Web Audio DSP" : "Native Audio"}</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Sound Check</span>
+						<span class="spec-val">{replayGainLabel}</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Equalizer</span>
+						<span class="spec-val">
+							{audioSettings.eqEnabled ? audioSettings.preset : (audioSettings.enhancer ? 'Sound Enhancer' : 'Flat')}
+						</span>
+					</div>
+					<div class="spec-card">
+						<span class="spec-label">Crossfade</span>
+						<span class="spec-val">{audioSettings.crossfade ? '8s Blend' : 'Disabled'}</span>
+					</div>
+				</div>
+
+				<div class="specs-footer">
+					<Icon name="waveform" size={15} />
+					<span>Destination: {outputLabel}</span>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	{#if song}
+		{#if isMobile && ui.panel && player.playing && !controlsVisible}
+			<button
+				class="show-controls"
+				aria-label="Show playback controls"
+				onclick={showControls}
+			>
+				<Icon name="chevronDown" size={16} />
+			</button>
+		{/if}
+		{#snippet panelBody(panel: Panel)}
+			{#key panel}
+				<!-- Any touch or scroll here only brings the controls back; it is not a control itself. -->
+				<div
+					class="panel-view"
+					role="presentation"
+					in:textSwap={{ dx: 40, duration: 320 }}
+					out:textSwap={{ dx: -40, duration: 240 }}
+					onwheel={panel === "lyrics" ? showControls : undefined}
+					ontouchmove={panel === "lyrics" ? showControls : undefined}
+					onpointerdown={panel === "lyrics" ? showControls : undefined}
+				>
+					{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+				</div>
+			{/key}
+		{/snippet}
+
+		<div class="layout" class:mobile-panel={mobileOpen}>
+			<div
+				class="main"
+				class:panel-shift={!isMobile && !!ui.panel}
+				bind:this={mainEl}
+			>
+				<div class="art-row" class:mini={mobileOpen}>
+					<div class="art-wrap" data-flip="art">
+						<div class="art" class:paused={!player.playing}>
+							<div class="art-layers">
+								{#if currentDisplay}
+									{#key currentDisplay.id}
+										<div
+											class="art-layer active"
+											in:artSwap={{ duration: 420 }}
+											out:fadeOnly={{ duration: 320 }}
+										>
+											<Artwork
+												id={currentDisplay.coverArt}
+												size={600}
+												seed={currentDisplay.album ?? currentDisplay.title}
+												priority
+											/>
+										</div>
+									{/key}
+								{/if}
+
+								{#if incomingDisplay}
+									<div class="art-layer incoming" class:fading-in={incomingActive}>
+										<Artwork
+											id={incomingDisplay.coverArt}
+											size={600}
+											seed={incomingDisplay.album ?? incomingDisplay.title}
+											priority
+										/>
+									</div>
+								{/if}
+							</div>
+						</div>
+					</div>
+					<div class="meta" inert={!mobileOpen ? true : undefined}>
+						<span class="c-title ellipsis">{song.title}</span>
+						<ArtistLinks
+							class="c-artist ellipsis"
+							item={song}
+							onclick={close}
+						/>
+					</div>
+					<button
+						class="round meta-btn"
+						inert={!mobileOpen ? true : undefined}
+						aria-label="Favorite"
+						onclick={() => ui.toggleLove("song", song)}
+					>
+						<Icon
+							name={ui.isLoved(song) ? "starFill" : "star"}
+							size={16}
+						/>
+					</button>
+					<button
+						class="round meta-btn"
+						inert={!mobileOpen ? true : undefined}
+						aria-label="More options"
+						onclick={(e) => ui.openMenu(e, songMenu(song))}
+					>
+						<Icon name="more" size={17} />
+					</button>
+				</div>
+
+				{#if mobileOpen && ui.panel}
+					<div
+						class="panel panel-mobile"
+						bind:this={panelEl}
+						in:panelIn
+						out:panelOut
+					>
+						{@render panelBody(ui.panel)}
+					</div>
+				{/if}
+
+				<div
+					class="controls"
+					class:panel-open={mobileOpen}
+					class:overlay={mobileOpen && !!ui.panel}
+					class:controls-hidden={isMobile && !!ui.panel && player.playing && !controlsVisible}
+				>
+					{#if !mobileOpen}
+						<div
+							class="info"
+							data-flip="info"
+							in:fadeOnly={{ duration: 260 }}
+						>
+							<div class="text-stage">
+								{#key song.id}
+									<div
+										class="text"
+										in:fadeOnly={{ duration: 240 }}
+										out:fadeOnly={{ duration: 180 }}
+									>
+										<span class="title ellipsis"
+											>{song.title}</span
+										>
+										<ArtistLinks
+											class="artist ellipsis"
+											item={song}
+											onclick={close}
+										/>
+									</div>
+								{/key}
+							</div>
+							<button
+								class="round"
+								class:on={ui.isLoved(song)}
+								aria-label="Favorite"
+								aria-pressed={ui.isLoved(song)}
+								onclick={() => ui.toggleLove("song", song)}
+							>
+								{#key ui.isLoved(song)}
+									<span
+										class="icon-swap"
+										in:pop={{ from: 0.3, duration: 320 }}
+									>
+										<Icon
+											name={ui.isLoved(song)
+												? "starFill"
+												: "star"}
+											size={16}
+										/>
+									</span>
+								{/key}
+							</button>
+							<button
+								class="round"
+								aria-label="More options"
+								onclick={(e) => ui.openMenu(e, songMenu(song))}
+							>
+								<Icon name="more" size={17} />
+							</button>
+						</div>
+					{/if}
+
+					<div class="progress" data-flip="progress">
+						{#if mobileOpen && ui.panel === "lyrics"}
+							<!-- Karaoke, like Apple Music Sing: right above the progress bar. -->
+							<button
+								class="sing-float"
+								class:on={!!player.karaoke}
+								aria-pressed={!!player.karaoke}
+								aria-label={player.karaoke ? "Karaoke on — back to the original" : "Karaoke"}
+								disabled={player.karaokeLoading}
+								onclick={toggleKaraoke}
+							>
+								{#if player.karaokeLoading}
+									<span class="karaoke-spin" aria-hidden="true"></span>
+								{:else}
+									<Icon name="micSing" size={18} />
+								{/if}
+							</button>
+						{/if}
+						<Slider
+							value={progressTime}
+							max={trackDuration}
+							label="Seek"
+							onchange={(v) => player.seek(v)}
+							oninput={(v) => (scrub = v)}
+						/>
+						<div class="times">
+							<span>{formattedCurrentTime}</span>
+							<div class="times-center">
+								{#if player.muted}
+									<!-- iOS ignores volume but honours mute, and the volume row is hidden while a panel is open. -->
+									<button
+										class="quality muted"
+										onclick={() => player.toggleMute()}
+										>Muted · Tap to unmute</button
+									>
+								{:else if player.karaoke}
+									<span class="quality sing-label">Sing</span>
+								{:else if sleepTimer.isActive}
+									<button
+										class="quality active-timer-text"
+										onclick={() => (ui.sleepTimerPicker = true)}
+									>
+										<Icon name="clock" size={11} />
+										{sleepTimer.isCountdown
+											? sleepTimer.remainingLabel
+											: "End of Track"}
+									</button>
+								{:else if player.crossfading}
+									<span
+										class="fade-notice"
+										in:fadeOnly={{ duration: 200 }}
+										out:fadeOnly={{ duration: 180 }}
+									>
+										<Icon name="crossfade" size={11} />
+										<span class="fade-notice-text">
+											Fading into {player.nextSong?.title ? `“${player.nextSong.title}”` : "next track"}
+										</span>
+									</span>
+								{:else if qualityBadgeLabel}
+									<button
+										class="quality-badge"
+										onclick={() => (showAudioSpecs = true)}
+										aria-label="Audio Quality: {qualityBadgeLabel} — click for technical details"
+										title="Audio Quality & Technical Details"
+										in:fadeOnly={{ duration: 200 }}
+									>
+										<svg class="quality-icon" viewBox="0 0 26 16" aria-hidden="true">
+											<path
+												d="M2 4c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.7"
+												stroke-linecap="round"
+											/>
+											<path
+												d="M2 8c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.7"
+												stroke-linecap="round"
+												opacity="0.78"
+											/>
+											<path
+												d="M2 12c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
+												fill="none"
+												stroke="currentColor"
+												stroke-width="1.7"
+												stroke-linecap="round"
+												opacity="0.55"
+											/>
+										</svg>
+										<span class="badge-text">{qualityBadgeLabel}</span>
+									</button>
+								{/if}
+							</div>
+							<span class="right">-{formattedRemainingTime}</span>
+						</div>
+					</div>
+
+					<div class="transport" data-flip="transport">
+						<button
+							class="skip"
+							aria-label="Previous"
+							onclick={() => player.previous()}
+							><Icon name="previous" size={36} /></button
+						>
+						<button
+							class="pp has-ring"
+							aria-label={player.active ? "Pause" : "Play"}
+							onclick={() => player.toggle()}
+						>
+							{#key player.active}
+								<span
+									class="icon-swap"
+									in:pop={{ from: 0.6, duration: 220 }}
+								>
+									<Icon
+										name={player.active ? "pause" : "play"}
+										size={46}
+									/>
+								</span>
+							{/key}
+							{#if player.buffering}<span class="loading-ring"
+								></span>{/if}
+						</button>
+						<button
+							class="skip"
+							aria-label="Next"
+							onclick={() => player.next()}
+							><Icon name="next" size={36} /></button
+						>
+					</div>
+
+					{#if !mobileOpen}
+						<div
+							class="volume"
+							data-flip="volume"
+							in:fadeOnly={{ duration: 260 }}
+						>
+							<button
+								aria-label={player.muted ? "Unmute" : "Mute"}
+								onclick={() => player.toggleMute()}
+								><Icon name="speakerLow" size={15} /></button
+							>
+							<Slider
+								value={player.muted ? 0 : player.volume}
+								max={1}
+								step={0.01}
+								label="Volume"
+								onchange={(v) => player.setVolume(v)}
+								oninput={(v) =>
+									v !== null && player.setVolume(v)}
+							/>
+							<Icon name="speaker" size={17} />
+						</div>
+					{/if}
+
+					<div class="bottom" data-flip="bottom">
+						<button
+							class="foot"
+							class:on={ui.panel === "lyrics"}
+							aria-label="Lyrics"
+							aria-pressed={ui.panel === "lyrics"}
+							onclick={() => toggleMobilePanel("lyrics")}
+						>
+							<Icon name="lyrics" size={21} />
+						</button>
+						<button
+							class="output"
+							class:connected={player.castState === "connected"}
+							class:stalled={player.castStalled}
+							aria-label="Playback device: {outputLabel}"
+							onclick={pickOutput}
+						>
+							<Icon name="airplay" size={21} />
+							<span>{outputLabel}</span>
+						</button>
+						<button
+							class="foot"
+							class:on={ui.panel === "queue"}
+							aria-label={player.shuffle ? "Playing Next, shuffle on" : "Playing Next"}
+							aria-pressed={ui.panel === "queue"}
+							onclick={() => toggleMobilePanel("queue")}
+						>
+							<!-- Shuffle on: the shuffle variant of the icon, as Apple Music shows it. -->
+							<Icon name={player.shuffle ? "queueShuffle" : "queue"} size={21} />
+						</button>
+					</div>
+				</div>
+			</div>
+
+			{#if !isMobile && ui.panel}
+				<div
+					class="panel panel-desktop"
+					in:textSwap={{ dx: 40, duration: 420 }}
+					out:textSwap={{ dx: -40, duration: 280 }}
+				>
+					{@render panelBody(ui.panel)}
+				</div>
+			{/if}
+		</div>
+	{:else}
+		<div class="nothing">
+			<Icon name="note" size={56} />
+			<p>Not Playing</p>
+		</div>
+	{/if}
+</div>
+
+<style>
+	.np {
+		position: fixed;
+		inset: 0;
+		z-index: 50;
+		color: #fff;
+		background: #3a3a3c;
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
+		transition: transform 0.25s ease;
+		--text: #fff;
+		--text-2: rgb(255 255 255 / 0.6);
+		--slider-fill: rgb(255 255 255 / 0.62);
+		--slider-track: rgb(255 255 255 / 0.2);
+	}
+
+	/* ---- backdrop --------------------------------------------------------------- */
+	.backdrop {
+		position: absolute;
+		inset: 0;
+		z-index: -1;
+		background: #1c1c1e;
+		contain: strict;
+		overflow: hidden;
+	}
+	.backdrop-layer {
+		position: absolute;
+		inset: 0;
+		overflow: hidden;
+		pointer-events: none;
+	}
+	.backdrop-layer.active {
+		z-index: 1;
+		opacity: 1;
+	}
+	.panel-veil {
+		position: absolute;
+		inset: 0;
+		z-index: 0;
+		opacity: 0;
+		background: rgb(0 0 0 / 0.5);
+		backdrop-filter: blur(26px);
+		-webkit-backdrop-filter: blur(26px);
+		transition: opacity 0.35s ease;
+		pointer-events: none;
+	}
+	.panel-veil.visible {
+		opacity: 1;
+	}
+	.backdrop-layer.incoming {
+		z-index: 2;
+		opacity: 0;
+		transition: opacity 6.5s cubic-bezier(0.4, 0, 0.2, 1);
+		will-change: opacity;
+	}
+	.backdrop-layer.incoming.fading-in {
+		opacity: 1;
+	}
+	.backdrop-art {
+		position: absolute;
+		inset: -4%;
+		width: 108%;
+		height: 108%;
+		z-index: 0;
+		object-fit: cover;
+		object-position: center;
+		filter: saturate(1.08);
+		pointer-events: none;
+		user-select: none;
+	}
+	.tint {
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		background:
+			linear-gradient(
+				180deg,
+				rgb(0 0 0 / 0.06) 0%,
+				rgb(0 0 0 / 0.16) 38%,
+				rgb(0 0 0 / 0.62) 100%
+			),
+			radial-gradient(120% 80% at 50% 25%, transparent 45%, rgb(0 0 0 / 0.32) 100%);
+		overflow: hidden;
+	}
+	.np.closing {
+		background: var(--chrome-strong, rgba(30, 30, 30, 0.95));
+	}
+	.np.closing .tint {
+		opacity: 0;
+		transition: none;
+	}
+	.mesh-aura {
+		position: absolute;
+		inset: -15%;
+		background: radial-gradient(circle at 50% 30%, var(--glow, transparent) 0%, transparent 60%);
+		opacity: 0.65;
+		animation: auraPulse 16s ease-in-out infinite alternate;
+		will-change: transform, opacity;
+		pointer-events: none;
+	}
+	.mesh-aura.paused {
+		animation-play-state: paused;
+	}
+	@keyframes auraPulse {
+		0% {
+			transform: scale(0.96) translate3d(0, 0, 0);
+			opacity: 0.45;
+		}
+		50% {
+			transform: scale(1.06) translate3d(2%, -1%, 0);
+			opacity: 0.8;
+		}
+		100% {
+			transform: scale(1) translate3d(-1%, 2%, 0);
+			opacity: 0.55;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.mesh-aura {
+			animation: none;
+		}
+	}
+	.backdrop::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		z-index: 3;
+		background: linear-gradient(
+			to bottom,
+			transparent 55%,
+			rgb(0 0 0 / 0.18)
+		);
+	}
+
+	/* ---- header --------------------------------------------------------------- */
+	.grab {
+		position: relative;
+		z-index: 2;
+		flex-shrink: 0;
+		display: flex;
+		justify-content: center;
+		padding-top: max(6px, env(safe-area-inset-top));
+	}
+	.dismiss {
+		height: 28px;
+		width: 100px;
+		display: grid;
+		place-items: center;
+		color: rgb(255 255 255 / 0.7);
+	}
+	.show-controls {
+		position: absolute;
+		right: max(16px, env(safe-area-inset-right));
+		bottom: max(16px, env(safe-area-inset-bottom));
+		z-index: 20;
+		width: 30px;
+		height: 30px;
+		display: grid;
+		place-items: center;
+		border-radius: 50%;
+		color: rgb(255 255 255 / 0.8);
+		background: rgb(0 0 0 / 0.2);
+		animation: show-controls-in 0.35s ease both;
+	}
+	.show-controls:active {
+		opacity: 0.7;
+	}
+	.show-controls :global(svg) {
+		transform: rotate(180deg);
+	}
+	@keyframes show-controls-in {
+		from {
+			opacity: 0;
+			transform: translateY(-6px) scale(0.85);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0) scale(1);
+		}
+	}
+	.dismiss :global(svg) {
+		display: none;
+	}
+	.pill {
+		width: 36px;
+		height: 5px;
+		border-radius: 3px;
+		background: rgb(255 255 255 / 0.4);
+	}
+
+	/* ---- layout --------------------------------------------------------------- */
+	.layout {
+		position: relative;
+		z-index: 1;
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		justify-content: center;
+		gap: 10vw;
+		padding: 0 28px max(12px, env(safe-area-inset-bottom));
+	}
+	.main {
+		width: min(100%, 440px);
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
+	}
+	/* Layout changes are NOT transitioned in CSS: the FLIP in the script animates
+	   [data-flip] elements with transforms instead (compositor only). No permanent
+	   will-change: running animations get their own layer anyway, and keeping six
+	   (the art is ~7MB at 3x) promoted all the time just wastes GPU memory. */
+	[data-flip] {
+		transform-origin: 0 0;
+	}
+	.art-row {
+		flex: 0 1 auto;
+		min-height: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 12px;
+		padding-top: 14px;
+	}
+	.art-row:not(.mini) {
+		gap: 0;
+	}
+	.art-wrap {
+		position: relative;
+		flex-shrink: 0;
+		width: min(100%, 50vh);
+	}
+	/* Diffused ambient glow halo directly behind the artwork (Apple Music / BitChord) */
+	.art-row:not(.mini) .art-wrap::before {
+		content: "";
+		position: absolute;
+		inset: -8%;
+		border-radius: 28px;
+		background: radial-gradient(
+			circle at 50% 50%,
+			color-mix(in srgb, var(--accent, var(--glow, transparent)) 50%, transparent) 0%,
+			transparent 75%
+		);
+		opacity: 0.9;
+		pointer-events: none;
+		z-index: 0;
+		transform: scale(1.08);
+		filter: blur(28px);
+	}
+	.art {
+		position: relative;
+		z-index: 1;
+		width: 100%;
+		--art-radius: 14px;
+		--art-shadow: 0 16px 48px var(--glow, rgb(0 0 0 / 0.35));
+		transition: transform 0.55s cubic-bezier(0.3, 1.35, 0.5, 1);
+		transform-origin: center 40%;
+	}
+	.art.paused {
+		transform: scale(0.85);
+		--art-shadow: 0 8px 22px rgb(0 0 0 / 0.25);
+	}
+	.art-layers {
+		position: relative;
+		width: 100%;
+		aspect-ratio: 1;
+		border-radius: var(--art-radius, 14px);
+	}
+	.art-layer {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+		border-radius: var(--art-radius, 14px);
+		overflow: hidden;
+	}
+	.art-layer.active {
+		z-index: 1;
+		opacity: 1;
+	}
+	.art-layer.incoming {
+		z-index: 2;
+		opacity: 0;
+		transition: opacity 6.5s cubic-bezier(0.4, 0, 0.2, 1);
+		will-change: opacity;
+	}
+	.art-layer.incoming.fading-in {
+		opacity: 1;
+	}
+	/* On mobile, the row also carries the compact title/buttons — collapsed to
+	   zero width (and hidden) whenever the art is at full size, since the art
+	   itself already claims all the row's width at that point. */
+	.meta {
+		flex: 1;
+		min-width: 0;
+		overflow: hidden;
+		display: flex;
+		flex-direction: column;
+		opacity: 0;
+		transition: opacity 0.2s ease;
+	}
+	.meta-btn {
+		transition: opacity 0.2s ease;
+	}
+	.art-row:not(.mini) .meta,
+	.art-row:not(.mini) .meta-btn {
+		width: 0;
+		flex: 0;
+		flex-shrink: 1;
+		overflow: hidden;
+		opacity: 0;
+		pointer-events: none;
+	}
+	.art-row.mini .meta,
+	.art-row.mini .meta-btn {
+		opacity: 1;
+	}
+	.controls {
+		flex: 1;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+		justify-content: space-evenly;
+		gap: 10px;
+		padding-top: 22px;
+		/* Only compositor properties: hiding/showing never re-lays out the page.
+		   (Layout changes when a panel opens are animated by the FLIP instead.) */
+		transition:
+			opacity 0.45s ease,
+			transform 0.45s ease;
+	}
+	.controls.controls-hidden {
+		opacity: 0;
+		transform: translateY(18px);
+		pointer-events: none;
+	}
+
+	/* ---- title row ------------------------------------------------------------ */
+	.info {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+	}
+	.text-stage {
+		flex: 1;
+		min-width: 0;
+		display: grid;
+		grid-template-columns: 1fr;
+		grid-template-rows: 1fr;
+		align-items: center;
+	}
+	.text-stage > .text {
+		grid-area: 1 / 1;
+		width: 100%;
+	}
+	.text {
+		flex: 1;
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 1px;
+	}
+	.title {
+		font-size: 20px;
+		font-weight: 600;
+		letter-spacing: -0.01em;
+		max-width: 100%;
+	}
+	:global(.artist) {
+		font-size: 19px;
+		color: rgb(255 255 255 / 0.58);
+		max-width: 100%;
+		text-align: left;
+	}
+	:global(.artist a:hover) {
+		text-decoration: underline;
+	}
+	.round {
+		width: 30px;
+		height: 30px;
+		flex-shrink: 0;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		color: #fff;
+		background: rgb(255 255 255 / 0.14);
+	}
+	.karaoke-spin {
+		width: 13px;
+		height: 13px;
+		border-radius: 50%;
+		border: 2px solid rgb(255 255 255 / 0.3);
+		border-top-color: #fff;
+		animation: karaoke-spin 0.8s linear infinite;
+	}
+	@keyframes karaoke-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	.round.on {
+		background: rgb(255 255 255 / 0.28);
+	}
+
+	/* ---- progress ------------------------------------------------------------- */
+	.progress :global(.slider) {
+		--h: 6px;
+		contain: layout paint;
+	}
+	.progress :global(.slider:hover),
+	.progress :global(.slider.dragging) {
+		--h: 10px;
+	}
+	.times {
+		display: grid;
+		grid-template-columns: 1fr auto 1fr;
+		align-items: center;
+		margin-top: 4px;
+		font-size: 11px;
+		font-weight: 600;
+		color: rgb(255 255 255 / 0.42);
+		font-variant-numeric: tabular-nums;
+	}
+	.times-center {
+		display: grid;
+		grid-template-columns: 1fr;
+		grid-template-rows: 1fr;
+		place-items: center;
+		justify-self: center;
+	}
+	.times-center > * {
+		grid-area: 1 / 1;
+	}
+	.sing-label {
+		color: rgb(255 255 255 / 0.75);
+	}
+	.progress {
+		position: relative;
+	}
+	.sing-float {
+		position: absolute;
+		right: 0;
+		bottom: calc(100% + 12px);
+		width: 34px;
+		height: 34px;
+		border-radius: 9px;
+		display: grid;
+		place-items: center;
+		color: #fff;
+		background: rgb(255 255 255 / 0.14);
+		transition:
+			background-color 0.2s ease,
+			color 0.2s ease;
+	}
+	.sing-float.on {
+		color: rgb(0 0 0 / 0.75);
+		background: rgb(255 255 255 / 0.85);
+	}
+	.times .right {
+		text-align: right;
+	}
+	.quality-badge {
+		cursor: pointer;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 4px;
+		height: auto;
+		padding: 0;
+		border: 0;
+		border-radius: 0;
+		background: none;
+		color: rgb(255 255 255 / 0.84);
+		font-size: 14px;
+		font-weight: 500;
+		letter-spacing: 0.01em;
+		transition: opacity 0.18s ease;
+		max-width: 210px;
+		user-select: none;
+	}
+	.quality-badge:hover {
+		opacity: 0.78;
+	}
+	.quality-badge:active {
+		opacity: 0.6;
+	}
+	.quality-icon {
+		width: 18px;
+		height: 10px;
+		flex-shrink: 0;
+		opacity: 0.9;
+	}
+	.badge-text {
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	/* Subtle crossfade notice: clean inline status text between timestamps (non-badge, non-clickable) */
+	.fade-notice {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 5px;
+		color: rgb(255 255 255 / 0.52);
+		font-size: 10.5px;
+		font-weight: 500;
+		letter-spacing: 0.01em;
+		text-transform: none;
+		max-width: 200px;
+		user-select: none;
+	}
+	.fade-notice :global(svg) {
+		opacity: 0.75;
+		flex-shrink: 0;
+	}
+	.fade-notice-text {
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.quality {
+		font-size: 11px;
+		font-weight: 600;
+		letter-spacing: 0.01em;
+	}
+	.active-timer-text {
+		color: #ffd60a;
+	}
+	.active-timer-text :global(svg) {
+		display: inline-block;
+		margin-right: 2px;
+		vertical-align: -1.5px;
+	}
+	.quality.muted {
+		color: #ffd60a;
+	}
+
+	/* ---- audio specs modal ---------------------------------------------------- */
+	.specs-overlay {
+		position: absolute;
+		inset: 0;
+		z-index: 60;
+		background: rgb(0 0 0 / 0.45);
+		backdrop-filter: blur(8px);
+		-webkit-backdrop-filter: blur(8px);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 20px;
+	}
+	.specs-sheet {
+		width: 100%;
+		max-width: 360px;
+		background: rgba(30, 30, 34, 0.9);
+		backdrop-filter: blur(28px);
+		-webkit-backdrop-filter: blur(28px);
+		border: 0.5px solid rgb(255 255 255 / 0.2);
+		border-radius: 20px;
+		padding: 20px;
+		box-shadow: 0 16px 40px rgb(0 0 0 / 0.5);
+		color: #fff;
+	}
+	.specs-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 16px;
+	}
+	.specs-title-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.specs-title-row h3 {
+		margin: 0;
+		font-size: 15px;
+		font-weight: 700;
+	}
+	.specs-badge {
+		font-size: 10px;
+		font-weight: 700;
+		letter-spacing: 0.05em;
+		text-transform: uppercase;
+		padding: 2px 6px;
+		border-radius: 4px;
+		background: #fff;
+		color: #000;
+	}
+	.specs-close {
+		width: 28px;
+		height: 28px;
+		border-radius: 50%;
+		background: rgb(255 255 255 / 0.12);
+		color: rgb(255 255 255 / 0.8);
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		cursor: pointer;
+	}
+	.specs-close:hover {
+		background: rgb(255 255 255 / 0.22);
+		color: #fff;
+	}
+	.quality-pick {
+		margin-bottom: 14px;
+	}
+	.quality-options {
+		display: grid;
+		gap: 6px;
+		margin-top: 6px;
+	}
+	.quality-options button {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 1px;
+		width: 100%;
+		padding: 9px 12px;
+		border-radius: 10px;
+		background: rgb(255 255 255 / 0.06);
+		border: 0.5px solid rgb(255 255 255 / 0.08);
+		color: #fff;
+		text-align: left;
+	}
+	.quality-options button.on {
+		background: color-mix(in srgb, var(--accent) 22%, rgb(255 255 255 / 0.06));
+		border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+	}
+	.quality-options button:disabled {
+		opacity: 0.6;
+	}
+	.quality-label {
+		font-size: 14px;
+		font-weight: 500;
+	}
+	.quality-options small {
+		font-size: 12px;
+		color: rgb(255 255 255 / 0.55);
+	}
+	.specs-grid {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 8px;
+		margin-bottom: 14px;
+	}
+	.spec-card {
+		background: rgb(255 255 255 / 0.06);
+		border: 0.5px solid rgb(255 255 255 / 0.08);
+		border-radius: 12px;
+		padding: 8px 10px;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.spec-label {
+		font-size: 10.5px;
+		color: rgb(255 255 255 / 0.5);
+		font-weight: 500;
+	}
+	.spec-val {
+		font-size: 12.5px;
+		color: #fff;
+		font-weight: 600;
+	}
+	.spec-val.highlight {
+		color: color-mix(in srgb, var(--accent, #30d158) 75%, #fff 25%);
+	}
+	.specs-footer {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		font-size: 11.5px;
+		color: rgb(255 255 255 / 0.65);
+		padding-top: 10px;
+		border-top: 0.5px solid rgb(255 255 255 / 0.1);
+	}
+
+	/* ---- transport ------------------------------------------------------------ */
+	.transport {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		gap: clamp(28px, 11vw, 56px);
+	}
+	.transport button {
+		display: grid;
+		place-items: center;
+		width: 68px;
+		height: 68px;
+		border-radius: 50%;
+		color: #fff;
+		transition:
+			opacity 0.14s ease,
+			background 0.14s ease;
+	}
+	.transport button:active {
+		opacity: 0.7;
+		background: rgb(255 255 255 / 0.12);
+	}
+
+	/* ---- volume --------------------------------------------------------------- */
+	.volume {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		color: rgb(255 255 255 / 0.5);
+	}
+	.volume button {
+		display: grid;
+		place-items: center;
+		color: inherit;
+	}
+	.volume :global(.slider) {
+		--h: 6px;
+	}
+
+	/* ---- footer --------------------------------------------------------------- */
+	.bottom {
+		display: grid;
+		grid-template-columns: 1fr auto 1fr;
+		align-items: center;
+		padding: 2px 10px 0;
+	}
+	.foot {
+		width: 40px;
+		height: 34px;
+		border-radius: 9px;
+		display: grid;
+		place-items: center;
+		color: rgb(255 255 255 / 0.55);
+	}
+	.foot:last-child {
+		justify-self: end;
+	}
+	.foot.on {
+		color: rgb(0 0 0 / 0.75);
+		background: rgb(255 255 255 / 0.85);
+	}
+	.output {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 3px;
+		color: rgb(255 255 255 / 0.55);
+		font-size: 11px;
+		font-weight: 500;
+	}
+	.output.connected {
+		color: #fff;
+	}
+	.output.stalled {
+		color: #ffd60a;
+	}
+
+	/* ---- side panel (lyrics / queue) ------------------------------------------ */
+	.panel {
+		width: min(48vw, 780px);
+		min-height: 0;
+		position: relative;
+		flex: 0 1 min(48vw, 780px);
+	}
+	.panel-view {
+		position: absolute;
+		inset: 0;
+		width: 100%;
+		height: 100%;
+	}
+	.nothing {
+		flex: 1;
+		display: grid;
+		place-content: center;
+		justify-items: center;
+		color: rgb(255 255 255 / 0.5);
+		font-size: 20px;
+		font-weight: 600;
+	}
+
+	/* ---- phones --------------------------------------------------------------- */
+	@media (max-width: 899px) {
+		.np {
+			border-radius: 28px 28px 0 0;
+		}
+		.layout {
+			flex-direction: column;
+			gap: 0;
+		}
+		.main {
+			/* positioned so the leaving panel (absolute) anchors correctly */
+			position: relative;
+			width: 100%;
+			flex: 1;
+			display: flex;
+			flex-direction: column;
+			min-height: 0;
+		}
+		.mobile-panel {
+			padding-top: 10px;
+		}
+		.art-row.mini {
+			padding-top: 0;
+		}
+		.art-row.mini .art-wrap {
+			width: 56px;
+		}
+		.art-row.mini .art {
+			--art-radius: 6px;
+		}
+		.c-title {
+			font-weight: 600;
+			font-size: 16px;
+		}
+		:global(.c-artist) {
+			color: rgb(255 255 255 / 0.58);
+			font-size: 15px;
+		}
+		.panel-mobile {
+			flex: 1;
+			min-height: 0;
+			width: auto;
+			margin: 0 -12px 10px;
+		}
+		.controls.panel-open {
+			flex: 0 0 auto;
+			max-height: 260px;
+			padding-top: 10px;
+			gap: 4px;
+		}
+		/* With lyrics open the controls float over the bottom of the panel, so
+		   auto-hiding them is a pure fade/slide: the lyrics area keeps its size
+		   instead of re-laying out (and re-scrolling) every frame. */
+		.controls.overlay {
+			position: absolute;
+			left: 0;
+			right: 0;
+			bottom: 0;
+			z-index: 2;
+			margin: 0 -12px;
+			padding: 28px 12px 0;
+		}
+		.mobile-panel:has(.controls.overlay) .panel-mobile {
+			margin-bottom: 0;
+			mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 200px),
+				transparent calc(100% - 178px),
+				transparent 100%
+			);
+			-webkit-mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 200px),
+				transparent calc(100% - 178px),
+				transparent 100%
+			);
+			transition: mask-image 0.45s ease, -webkit-mask-image 0.45s ease;
+		}
+		.mobile-panel:has(.controls.overlay.controls-hidden) .panel-mobile {
+			mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 80px),
+				transparent 100%
+			);
+			-webkit-mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 80px),
+				transparent 100%
+			);
+		}
+	}
+
+	/* ---- desktop -------------------------------------------------------------- */
+	@media (min-width: 900px) {
+		.layout {
+			position: relative;
+		}
+		.pill {
+			display: none;
+		}
+		.dismiss {
+			width: 28px;
+			position: absolute;
+			left: 20px;
+			top: 16px;
+			border-radius: 50%;
+			background: rgb(255 255 255 / 0.1);
+		}
+		.dismiss :global(svg) {
+			display: block;
+		}
+		.grab {
+			height: 52px;
+		}
+		@media (display-mode: window-controls-overlay) {
+			.grab {
+				-webkit-app-region: drag;
+			}
+			.dismiss {
+				-webkit-app-region: no-drag;
+			}
+		}
+		.main {
+			width: min(40vw, 440px);
+			justify-content: center;
+			transition:
+				width 0.45s cubic-bezier(0.2, 0.8, 0.2, 1),
+				transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+		}
+		.main.panel-shift {
+			transform: translateX(calc((min(48vw, 780px) + 10vw) / -2));
+		}
+		.panel-desktop {
+			position: absolute;
+			top: 0;
+			bottom: 0;
+			left: calc(50% + (min(40vw, 440px) + 10vw - min(48vw, 780px)) / 2);
+			flex: none;
+		}
+		.controls {
+			flex: 0 0 auto;
+			gap: 18px;
+		}
+	}
+
+	/* Portrait phones: cover hero on top, tint wash below, card hidden. */
+	@media (max-width: 899px) and (orientation: portrait) {
+		/* The drag handle always floats over the art. Reserving its space on the
+		   layout (only while a panel is open) avoids the end-of-close snap. */
+		.grab {
+			position: absolute;
+			top: 0;
+			left: 0;
+			right: 0;
+			z-index: 30;
+			pointer-events: none;
+		}
+		.grab :global(.dismiss) {
+			pointer-events: auto;
+		}
+		.layout {
+			transition: padding-top 0.25s ease;
+		}
+		.layout.mobile-panel {
+			padding-top: max(34px, env(safe-area-inset-top));
+		}
+		.art-row:not(.mini) {
+			padding-top: 0;
+		}
+		.art-row:not(.mini) .art-wrap {
+			opacity: 0;
+			pointer-events: none;
+		}
+		.art-row:not(.mini) .art-wrap::before {
+			display: none;
+		}
+		.backdrop-art {
+			inset: 0 0 auto 0;
+			width: 100%;
+			height: 52vh;
+			object-position: center;
+			-webkit-mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 86%,
+				transparent 100%
+			);
+			mask-image: linear-gradient(to bottom, #000 0%, #000 86%, transparent 100%);
+		}
+		.tint {
+			background: linear-gradient(
+				180deg,
+				rgb(0 0 0 / 0) 0%,
+				rgb(0 0 0 / 0) 42%,
+				color-mix(in srgb, var(--top) 26%, rgb(0 0 0 / 0.25)) 56%,
+				color-mix(in srgb, var(--bottom) 62%, #000 38%) 100%
+			);
+		}
+	}
+
+	/* Landscape keeps the previous look: full-bleed soft wash and the art card. */
+	@media (max-width: 899px) and (orientation: landscape) {
+		.backdrop-art {
+			inset: -8%;
+			width: 116%;
+			height: 116%;
+			filter: saturate(1.1) brightness(0.55);
+			-webkit-mask-image: none;
+			mask-image: none;
+		}
+		.tint {
+			background: linear-gradient(180deg, rgb(0 0 0 / 0.45), rgb(0 0 0 / 0.72));
+		}
+	}
+</style>

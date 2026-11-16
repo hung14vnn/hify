@@ -1,0 +1,264 @@
+<script lang="ts">
+	// Square artwork tile used for albums and playlists, with the Apple Music hover
+	// affordances: a play button bottom-left and a "more" button bottom-right.
+	import Artwork from './Artwork.svelte';
+	import Icon from './Icon.svelte';
+
+	import type { Snippet } from 'svelte';
+	let {
+		href = '#',
+		onclick,
+		coverArt,
+		title,
+		subtitle,
+		subtitleHref,
+		subtitleSlot,
+		explicit = false,
+		icon = 'note',
+		onplay,
+		onmenu,
+		onprefetch
+	}: {
+		href?: string;
+		onclick?: () => void;
+		coverArt?: string;
+		title: string;
+		subtitle?: string;
+		subtitleHref?: string;
+		subtitleSlot?: Snippet;
+		explicit?: boolean;
+		icon?: string;
+		onplay?: () => void;
+		onmenu?: (e: MouseEvent) => void;
+		/** Pressed (before the click lands): warm up what the linked page needs. */
+		onprefetch?: () => void;
+	} = $props();
+
+	// A mouse press is always meant for the card, so it prefetches at once. A touch
+	// may just be the start of a scroll: prefetch only once the finger has rested
+	// briefly or lifted without moving, so swiping through a grid of cards doesn't
+	// fire a request (and wake the radio) for every card it starts on.
+	const HOLD_MS = 90;
+	const SLOP_PX = 10;
+	let press: { x: number; y: number; timer: number } | null = null;
+
+	function fire() {
+		cancel();
+		onprefetch?.();
+	}
+	function cancel() {
+		if (press) clearTimeout(press.timer);
+		press = null;
+	}
+	function onpointerdown(e: PointerEvent) {
+		if (!onprefetch) return;
+		if (e.pointerType === 'mouse') return onprefetch();
+		cancel();
+		press = { x: e.clientX, y: e.clientY, timer: window.setTimeout(fire, HOLD_MS) };
+	}
+	function onpointermove(e: PointerEvent) {
+		if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > SLOP_PX) cancel();
+	}
+	function onpointerup() {
+		if (press) fire();
+	}
+</script>
+
+<div
+	class="card"
+	oncontextmenu={onmenu}
+	{onpointerdown}
+	{onpointermove}
+	{onpointerup}
+	onpointercancel={cancel}
+	role="group"
+>
+	<a
+		class="cover"
+		{href}
+		aria-label={title}
+		onclick={(e) => {
+			if (onclick) {
+				e.preventDefault();
+				onclick();
+			}
+		}}
+	>
+		<Artwork id={coverArt} seed={title} alt="" {icon} />
+		<div class="overlay">
+			{#if onplay}
+				<button
+					class="play"
+					aria-label="Play {title}"
+					onclick={(e) => {
+						e.preventDefault();
+						e.stopPropagation();
+						onplay();
+					}}><Icon name="play" size={18} /></button
+				>
+			{/if}
+			{#if onmenu}
+				<button
+					class="more"
+					aria-label="More options"
+					onclick={(e) => {
+						e.preventDefault();
+						onmenu(e);
+					}}><Icon name="more" size={18} /></button
+				>
+			{/if}
+		</div>
+	</a>
+	<div class="meta">
+		<a
+			class="title"
+			{href}
+			onclick={(e) => {
+				if (onclick) {
+					e.preventDefault();
+					onclick();
+				}
+			}}
+		>
+			<span class="clamp">{title}</span>
+			{#if explicit}<span class="explicit" aria-label="Explicit">E</span>{/if}
+		</a>
+		{#if subtitleSlot}
+			{@render subtitleSlot()}
+		{:else if subtitle}
+			{#if subtitleHref}
+				<a class="subtitle" href={subtitleHref}>{subtitle}</a>
+			{:else}
+				<span class="subtitle">{subtitle}</span>
+			{/if}
+		{/if}
+	</div>
+</div>
+
+<style>
+	.card {
+		min-width: 0;
+	}
+	.cover {
+		position: relative;
+		display: block;
+		border-radius: 8px;
+		--art-shadow: 0 0 0 0.5px var(--hairline);
+	}
+	.cover :global(.art) {
+		transition:
+			transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1),
+			box-shadow 0.35s ease;
+	}
+	@media (hover: hover) {
+		.card:hover .cover :global(.art) {
+			transform: translateY(-3px);
+			box-shadow:
+				0 12px 28px rgb(0 0 0 / 0.18),
+				0 0 0 0.5px var(--hairline);
+		}
+		.card:hover .overlay {
+			transform: translateY(-3px);
+		}
+	}
+	.overlay {
+		position: absolute;
+		inset: 0;
+		border-radius: 8px;
+		display: flex;
+		align-items: flex-end;
+		justify-content: space-between;
+		padding: 10px;
+		opacity: 0;
+		background: linear-gradient(to top, rgb(0 0 0 / 0.38), transparent 55%);
+		transition:
+			opacity 0.18s ease,
+			transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+	}
+	.overlay button {
+		transform: translateY(6px);
+	}
+	.card:hover .overlay button,
+	.overlay:focus-within button {
+		transform: none;
+	}
+	@media (hover: hover) {
+		.card:hover .overlay,
+		.cover:focus-visible .overlay,
+		.overlay:focus-within {
+			opacity: 1;
+		}
+	}
+	
+	.overlay button {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		color: #fff;
+		/* Sử dụng màu tối có độ trong suốt kết hợp viền hairline mỏng thay vì blur */
+		background: rgba(30, 30, 32, 0.75);
+		border: 0.5px solid rgba(255, 255, 255, 0.2);
+		box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+		transition:
+			transform 0.15s ease,
+			background 0.15s ease,
+			border-color 0.15s ease;
+	}
+	.overlay button:hover {
+		background: var(--accent);
+		border-color: transparent;
+		transform: scale(1.08);
+	}
+	.overlay .play :global(svg) {
+		margin-left: 2px;
+	}
+	.meta {
+		padding-top: 8px;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		font-size: 13px;
+		line-height: 1.35;
+	}
+	.title {
+		display: flex;
+		align-items: baseline;
+		gap: 4px;
+		font-weight: 500;
+		color: var(--text);
+		min-width: 0;
+	}
+	.clamp {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.subtitle {
+		display: -webkit-box;
+		font-size: 13px;
+		font-weight: 400;
+		color: var(--text-2) !important;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+	}
+	/* ArtistLinks renders the subtitle from a child component, so its class is
+	   not covered by Card's scoped selector without an explicit global part. */
+	.meta :global(.subtitle) {
+		display: -webkit-box;
+		color: var(--text-2) !important;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		-webkit-box-orient: vertical;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+	}
+	a.subtitle:hover,
+	a.title:hover {
+		text-decoration: underline;
+	}
+</style>

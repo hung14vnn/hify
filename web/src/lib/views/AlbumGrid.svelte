@@ -1,0 +1,113 @@
+<script lang="ts">
+	// Paged album grid used by Albums, Recently Added and Genre pages.
+	import { untrack } from 'svelte';
+	import { cachedNow, getAlbumList } from '../api';
+	import AlbumCard from '../components/AlbumCard.svelte';
+	import ErrorState from '../components/ErrorState.svelte';
+	import Icon from '../components/Icon.svelte';
+	import Sentinel from '../components/Sentinel.svelte';
+	import SortMenu from '../components/SortMenu.svelte';
+	import { router } from '../router.svelte';
+	import type { Album, AlbumListType } from '../types';
+
+	const PAGE = 60;
+
+	let {
+		title,
+		initialType = 'alphabeticalByName',
+		genre,
+		sortable = false,
+		limit
+	}: { title: string; initialType?: AlbumListType; genre?: string; sortable?: boolean; limit?: number } = $props();
+
+	let type = $state<AlbumListType>(untrack(() => initialType));
+	let albums = $state<Album[]>([]);
+	let done = $state(false);
+	let loading = $state(false);
+	let error = $state<unknown>(null);
+	let generation = 0;
+
+	const sorts: { value: AlbumListType; label: string }[] = [
+		{ value: 'alphabeticalByName', label: 'Title' },
+		{ value: 'alphabeticalByArtist', label: 'Artist' },
+		{ value: 'newest', label: 'Recently Added' },
+		{ value: 'recent', label: 'Recently Played' },
+		{ value: 'frequent', label: 'Most Played' }
+	];
+
+	async function more() {
+		if (loading || done) return;
+		loading = true;
+		const gen = generation;
+		try {
+			const extra = genre ? { genre } : {};
+			const listType = genre ? 'byGenre' : type;
+			const fetchPage = () => getAlbumList(listType, PAGE, albums.length, extra);
+			// The first page comes from the on-device copy (synchronously on a revisit) and is
+			// replaced if the server's differs, as long as the user hasn't paged further.
+			const page = albums.length
+				? await fetchPage()
+				: await cachedNow(`albums:${listType}:${genre ?? ''}`, fetchPage, {
+						fresh: 0,
+						refresh: (fresh) => {
+							if (gen === generation && albums.length <= PAGE) albums = [...fresh];
+						}
+					});
+			if (gen !== generation) return;
+			albums.push(...page);
+			if (page.length < PAGE || (limit && albums.length >= limit)) done = true;
+		} catch (e) {
+			error = e;
+			done = true;
+		} finally {
+			if (gen === generation) loading = false;
+		}
+	}
+
+	$effect(() => {
+		void type;
+		void genre;
+		generation++;
+		albums = [];
+		done = false;
+		loading = false;
+		error = null;
+		untrack(more);
+	});
+
+</script>
+
+<div class="page">
+	<div class="head">
+		<button class="back" onclick={() => router.go('/library')}><Icon name="chevronLeft" size={18} />Library</button>
+		{#if sortable}
+			<SortMenu value={type} options={sorts} onchange={(value) => (type = value as AlbumListType)} />
+		{/if}
+	</div>
+	<h1 class="page-title">{title}</h1>
+	{#if error && !albums.length}
+		<ErrorState {error} />
+	{:else if done && !albums.length}
+		<div class="empty-state"><h3>No Albums</h3></div>
+	{:else}
+		<div class="grid">
+			{#each albums as album (album.id)}<AlbumCard {album} />{/each}
+		</div>
+		{#if !done}<Sentinel onvisible={more} {loading} />{/if}
+	{/if}
+</div>
+
+<style>
+	.head {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 0 var(--gutter);
+		margin-bottom: 8px;
+	}
+	.back { display: inline-flex; align-items: center; gap: 2px; color: var(--accent); font-size: 14px; white-space: nowrap; }
+	@media (max-width: 699px) {
+		:global(.page > .grid) { padding-left: 10px; padding-right: 10px; }
+	}
+</style>

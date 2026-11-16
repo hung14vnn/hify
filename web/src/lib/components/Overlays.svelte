@@ -1,0 +1,706 @@
+<script lang="ts">
+	// Context menu, "Add to Playlist" sheet and toast; one instance at the app root.
+	import { dialog, fadeOnly, pop, toast } from "../motion";
+	import { ui } from "../ui.svelte";
+	import Artwork from "./Artwork.svelte";
+	import Icon from "./Icon.svelte";
+	import { sleepTimer } from "../sleepTimer.svelte";
+	import { artistName } from "../format";
+	import { removeFromLibrary } from "../menus";
+	import { getPlayer } from "../player.svelte";
+
+	const player = getPlayer();
+
+	let menuEl = $state<HTMLDivElement | null>(null);
+	let pos = $state({ x: 0, y: 0 });
+	let newName = $state("");
+
+	// TỐI ƯU 1: Tính toán lại vị trí Menu an toàn khi DOM đã render
+	$effect(() => {
+		const m = ui.menu;
+		if (!m || !menuEl) return;
+
+		const { offsetWidth: w, offsetHeight: h } = menuEl;
+		pos = {
+			x: Math.max(8, Math.min(m.x, window.innerWidth - w - 8)),
+			y: m.y + h > window.innerHeight - 8 ? Math.max(8, m.y - h) : m.y,
+		};
+
+		menuEl.querySelector<HTMLButtonElement>("button")?.focus();
+	});
+
+	$effect(() => {
+		if (ui.playlistPicker) {
+			ui.refreshPlaylists();
+			newName = "";
+		}
+	});
+
+	// ---- "Remove from Library" confirmation ----
+	let removing = $state(false);
+	let removeError = $state<string | null>(null);
+	let stopWanted = $state(true);
+
+	$effect(() => {
+		if (!ui.removal) return;
+		removeError = null;
+		stopWanted = true;
+	});
+
+	function closeRemoval() {
+		if (!removing) ui.removal = null;
+	}
+
+	async function confirmRemoval() {
+		const target = ui.removal;
+		if (!target || removing) return;
+		removing = true;
+		removeError = null;
+		try {
+			await removeFromLibrary(target, stopWanted);
+			ui.removal = null;
+		} catch (e) {
+			removeError =
+				e instanceof Error && e.message
+					? e.message
+					: target.kind === "track"
+						? "Couldn’t remove this file"
+						: "Couldn’t remove this album";
+		} finally {
+			removing = false;
+		}
+	}
+
+	function onKey(e: KeyboardEvent) {
+		if (e.key !== "Escape") return;
+		if (ui.menu) ui.menu = null;
+		else if (ui.removal) closeRemoval();
+		else if (ui.playlistPicker) ui.playlistPicker = null;
+		else if (ui.sleepTimerPicker) ui.sleepTimerPicker = false;
+		else if (player.karaokeWaiting) player.dismissKaraokeWait();
+	}
+</script>
+
+<svelte:window onkeydown={onKey} onresize={() => (ui.menu = null)} />
+
+{#if ui.menu}
+	<div
+		class="scrim"
+		role="presentation"
+		onclick={() => (ui.menu = null)}
+		oncontextmenu={(e) => {
+			e.preventDefault();
+			ui.menu = null;
+		}}
+	></div>
+	<div
+		class="menu"
+		role="menu"
+		in:pop
+		out:fadeOnly={{ duration: 120 }}
+		bind:this={menuEl}
+		style:left="{pos.x}px"
+		style:top="{pos.y}px"
+	>
+		{#each ui.menu.items as item}
+			<button
+				role="menuitem"
+				class:danger={item.danger}
+				onclick={() => {
+					ui.menu = null;
+					item.action();
+				}}
+			>
+				<span>{item.label}</span>
+				{#if item.icon}<Icon name={item.icon} size={17} />{/if}
+			</button>
+		{/each}
+	</div>
+{/if}
+
+{#if ui.playlistPicker}
+	{@const songs = ui.playlistPicker}
+	<div
+		class="sheet-scrim"
+		role="presentation"
+		transition:fadeOnly
+		onclick={() => (ui.playlistPicker = null)}
+	></div>
+	<div
+		class="sheet"
+		role="dialog"
+		in:dialog
+		out:fadeOnly={{ duration: 150 }}
+		aria-modal="true"
+		aria-label="Add to Playlist"
+	>
+		<header>
+			<h3>Add to Playlist</h3>
+			<button
+				class="x"
+				aria-label="Close"
+				onclick={() => (ui.playlistPicker = null)}
+			>
+				<Icon name="close" size={18} />
+			</button>
+		</header>
+		<form
+			class="new"
+			onsubmit={(e) => {
+				e.preventDefault();
+				if (!newName.trim()) return;
+				ui.createPlaylistWith(newName.trim(), songs);
+				ui.playlistPicker = null;
+			}}
+		>
+			<span class="plus"><Icon name="plus" size={22} /></span>
+			<input placeholder="New Playlist…" bind:value={newName} />
+			{#if newName.trim()}<button class="create" type="submit"
+					>Create</button
+				>{/if}
+		</form>
+		<ul>
+			{#each ui.playlists as pl (pl.id)}
+				<li>
+					<button
+						onclick={() => {
+							ui.addSongsToPlaylist(pl, songs);
+							ui.playlistPicker = null;
+						}}
+					>
+						<span class="art"
+							><Artwork
+								id={pl.coverArt}
+								size={64}
+								seed={pl.name}
+								icon="playlist"
+							/></span
+						>
+						<span class="text">
+							<span class="ellipsis">{pl.name}</span>
+							<small>{pl.songCount ?? 0} songs</small>
+						</span>
+					</button>
+				</li>
+			{/each}
+		</ul>
+	</div>
+{/if}
+
+{#if ui.removal}
+	{@const target = ui.removal}
+	<div class="sheet-scrim" role="presentation" transition:fadeOnly onclick={closeRemoval}></div>
+	<div
+		class="sheet confirm"
+		role="alertdialog"
+		in:dialog
+		out:fadeOnly={{ duration: 150 }}
+		aria-modal="true"
+		aria-labelledby="remove-title"
+	>
+		<header>
+			<h3 id="remove-title">{target.kind === "track" ? "Remove File" : "Remove Album"}</h3>
+		</header>
+		<p class="body">
+			{#if target.kind === "track"}
+				Remove <strong>{target.song.title}</strong> from your library? This deletes the file
+				from disk - this can’t be undone.
+			{:else}
+				Remove <strong>{target.album.name}</strong>{#if artistName(target.album)}
+					by <strong>{artistName(target.album)}</strong>{/if} from your library? The album’s local
+				files will be permanently deleted from disk - this can’t be undone.
+			{/if}
+		</p>
+		{#if target.kind === "album"}
+			<label class="option">
+				<input type="checkbox" bind:checked={stopWanted} disabled={removing} />
+				<span>
+					<span class="option-title">Stop the Wanted watcher</span>
+					<small>Uncheck this to keep looking for a replacement after the album is removed.</small>
+				</span>
+			</label>
+		{/if}
+		{#if removeError}<p class="error" role="alert">{removeError}</p>{/if}
+		<div class="buttons">
+			<button class="secondary" onclick={closeRemoval} disabled={removing}>Cancel</button>
+			<button class="destructive" onclick={confirmRemoval} disabled={removing}>
+				{removing ? "Removing…" : "Remove"}
+			</button>
+		</div>
+	</div>
+{/if}
+
+{#if player.karaokeWaiting}
+	<div
+		class="sheet-scrim"
+		role="presentation"
+		transition:fadeOnly
+		onclick={() => player.dismissKaraokeWait()}
+	></div>
+	<div
+		class="sheet karaoke"
+		role="dialog"
+		in:dialog
+		out:fadeOnly={{ duration: 150 }}
+		aria-modal="true"
+		aria-labelledby="karaoke-title"
+	>
+		<header>
+			<div class="title-wrap">
+				<h3 id="karaoke-title">
+					{#if !player.karaokeError}<span class="spin" aria-hidden="true"></span>{/if}
+					Karaoke
+				</h3>
+				<p class="subtitle">
+					{#if player.karaokeError}
+						{player.karaokePreview
+							? "AI stems failed · vocal cut playing"
+							: "Couldn’t prepare karaoke"}
+					{:else if player.karaokePreview}
+						Vocal cut playing · AI stems on the way
+					{:else}
+						Cutting the vocals…
+					{/if}
+				</p>
+			</div>
+			<button class="x" aria-label="Hide" onclick={() => player.dismissKaraokeWait()}>
+				<Icon name="close" size={18} />
+			</button>
+		</header>
+		<p class="body">
+			{#if player.karaokeError}
+				{player.karaokeError}{#if player.karaokePreview} You can keep singing on the vocal cut.{/if}
+			{:else}
+				You can start singing right away. The AI version takes over from the same point as soon
+				as it’s ready.
+			{/if}
+		</p>
+		<div class="buttons">
+			<button class="secondary" onclick={() => player.dismissKaraokeWait()}>Hide</button>
+			<button class="primary" onclick={() => void player.toggleKaraoke()}>Turn Off</button>
+		</div>
+	</div>
+{/if}
+
+{#if ui.toast}
+	<div class="toast" role="status" in:toast out:fadeOnly>{ui.toast}</div>
+{/if}
+
+{#if ui.sleepTimerPicker}
+	<div
+		class="sheet-scrim"
+		role="presentation"
+		transition:fadeOnly
+		onclick={() => (ui.sleepTimerPicker = false)}
+	></div>
+	<div
+		class="sheet"
+		role="dialog"
+		in:dialog
+		out:fadeOnly={{ duration: 150 }}
+		aria-modal="true"
+		aria-label="Sleep Timer"
+	>
+		<header>
+			<div class="title-wrap">
+				<h3>Sleep Timer</h3>
+				{#if sleepTimer.isActive}
+					<p class="subtitle">
+						{#if sleepTimer.isCountdown}
+							Pauses in {sleepTimer.remainingLabel}
+						{:else}
+							Pauses after current song
+						{/if}
+					</p>
+				{/if}
+			</div>
+			<button
+				class="x"
+				aria-label="Close"
+				onclick={() => (ui.sleepTimerPicker = false)}
+			>
+				<Icon name="close" size={18} />
+			</button>
+		</header>
+		<ul class="options">
+			{#if sleepTimer.isActive}
+				<li>
+					<button
+						class="danger-btn"
+						onclick={() => {
+							sleepTimer.cancel();
+							ui.sleepTimerPicker = false;
+						}}
+					>
+						<span class="text">Stop Timer</span>
+					</button>
+				</li>
+			{/if}
+			{#each [15, 30, 45, 60, 90] as minutes}
+				<li>
+					<button
+						onclick={() => {
+							sleepTimer.setMinutes(minutes);
+							ui.sleepTimerPicker = false;
+						}}
+					>
+						<span class="text">In {minutes} Minutes</span>
+						{#if sleepTimer.isCountdown && sleepTimer.remainingLabel === `${minutes}:00`}
+							<Icon name="play" size={14} class="check" />
+						{/if}
+					</button>
+				</li>
+			{/each}
+			<li>
+				<button
+					onclick={() => {
+						sleepTimer.setEndOfTrack();
+						ui.sleepTimerPicker = false;
+					}}
+				>
+					<span class="text">When Current Song Ends</span>
+					{#if sleepTimer.isEndOfTrack}
+						<Icon name="play" size={14} class="check" />
+					{/if}
+				</button>
+			</li>
+		</ul>
+	</div>
+{/if}
+
+<style>
+	.scrim,
+	.sheet-scrim {
+		position: fixed;
+		inset: 0;
+		z-index: 90;
+	}
+	.sheet-scrim {
+		background: rgba(0, 0, 0, 0.4);
+	}
+	.menu {
+		position: fixed;
+		z-index: 91;
+		min-width: 220px;
+		padding: 5px;
+		border-radius: 12px;
+
+		background: var(--menu, rgba(32, 32, 35, 0.88));
+		box-shadow:
+			0 12px 40px rgba(0, 0, 0, 0.28),
+			0 0 0 0.5px var(--hairline);
+		transform-origin: top left;
+		will-change: transform, opacity;
+	}
+	.menu button {
+		animation: item-in 0.2s ease both;
+		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 20px;
+		height: 32px;
+		padding: 0 10px;
+		border-radius: 7px;
+		font-size: 14px;
+		color: var(--text);
+		text-align: left;
+		transition:
+			background 0.12s ease,
+			color 0.12s ease;
+	}
+	.menu button :global(svg) {
+		color: var(--text-2);
+		transition: color 0.12s ease;
+	}
+	.menu button:hover,
+	.menu button:focus-visible {
+		background: var(--accent);
+		color: #fff;
+		outline: none;
+	}
+	.menu button:hover :global(svg),
+	.menu button:focus-visible :global(svg) {
+		color: #fff;
+	}
+	.menu button:nth-child(2) {
+		animation-delay: 15ms;
+	}
+	.menu button:nth-child(3) {
+		animation-delay: 30ms;
+	}
+	.menu button:nth-child(4) {
+		animation-delay: 45ms;
+	}
+	.menu button:nth-child(n + 5) {
+		animation-delay: 60ms;
+	}
+
+	@keyframes item-in {
+		from {
+			opacity: 0;
+			transform: translateY(-3px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+
+	.menu .danger {
+		color: #ff3b30;
+	}
+	.sheet {
+		position: fixed;
+		z-index: 91;
+		left: 50%;
+		top: 50%;
+		transform: translate(-50%, -50%);
+		width: min(420px, calc(100vw - 32px));
+		max-height: min(560px, 80vh);
+		display: flex;
+		flex-direction: column;
+		border-radius: 16px;
+		background: var(--bg-elevated);
+		box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+		overflow: hidden;
+		will-change: transform, opacity;
+	}
+	.sheet header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 16px 16px 8px;
+	}
+	.title-wrap {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+	}
+	.sheet h3 {
+		margin: 0;
+		font-size: 17px;
+	}
+	.subtitle {
+		margin: 2px 0 0;
+		font-size: 13px;
+		color: var(--text-2);
+	}
+	.x {
+		width: 30px;
+		height: 30px;
+		border-radius: 50%;
+		display: grid;
+		place-items: center;
+		background: var(--fill);
+		color: var(--text-2);
+	}
+	.new {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 8px 16px;
+	}
+	.plus {
+		width: 48px;
+		height: 48px;
+		border-radius: 6px;
+		display: grid;
+		place-items: center;
+		color: var(--accent);
+		background: var(--fill);
+		flex-shrink: 0;
+	}
+	.new input {
+		flex: 1;
+		min-width: 0;
+		border: 0;
+		background: none;
+		font: inherit;
+		font-size: 15px;
+		color: var(--text);
+		outline: none;
+	}
+	.create {
+		color: var(--accent);
+		font-weight: 600;
+	}
+	.sheet ul {
+		list-style: none;
+		margin: 0;
+		padding: 0 8px 12px;
+		overflow-y: auto;
+	}
+	.sheet li button {
+		width: 100%;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 10px 12px;
+		border-radius: 8px;
+		text-align: left;
+		color: var(--text);
+		transition: background 0.12s ease;
+	}
+	.sheet li button:hover {
+		background: var(--hover);
+	}
+	.sheet li button.danger-btn {
+		color: #ff3b30;
+	}
+	.sheet li button :global(.check) {
+		color: var(--accent);
+	}
+	.art {
+		width: 48px;
+		--art-radius: 6px;
+	}
+	.text {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
+		font-size: 15px;
+	}
+	.text small {
+		color: var(--text-2);
+		font-size: 12px;
+	}
+	.art img,
+	.art-empty {
+		display: grid;
+		place-items: center;
+		width: 48px;
+		height: 48px;
+		border-radius: var(--art-radius);
+		object-fit: cover;
+		background: var(--fill);
+		color: var(--text-2);
+	}
+	.dur {
+		flex-shrink: 0;
+		color: var(--text-2);
+		font-size: 12px;
+		font-variant-numeric: tabular-nums;
+	}
+	.sheet li.status {
+		padding: 16px 12px;
+		color: var(--text-2);
+		font-size: 14px;
+		text-align: center;
+	}
+	.sheet li.status:empty {
+		display: none;
+	}
+
+	.confirm .body {
+		margin: 0;
+		padding: 4px 16px 12px;
+		font-size: 14px;
+		line-height: 1.45;
+		color: var(--text-2);
+	}
+	.confirm .body strong {
+		color: var(--text);
+		font-weight: 600;
+	}
+	.karaoke .body {
+		margin: 0;
+		padding: 4px 16px 14px;
+		font-size: 14px;
+		line-height: 1.45;
+		color: var(--text-2);
+	}
+	.karaoke h3 {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+	.karaoke .spin {
+		width: 14px;
+		height: 14px;
+		border-radius: 50%;
+		border: 2px solid var(--fill);
+		border-top-color: var(--accent);
+		animation: karaoke-spin 0.8s linear infinite;
+	}
+	@keyframes karaoke-spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	.option {
+		display: flex;
+		align-items: flex-start;
+		gap: 10px;
+		margin: 0 16px 12px;
+		padding: 10px 12px;
+		border-radius: 10px;
+		background: var(--fill);
+		font-size: 13px;
+		cursor: pointer;
+	}
+	.option input {
+		margin-top: 2px;
+		accent-color: var(--accent);
+	}
+	.option-title {
+		display: block;
+		font-weight: 600;
+		color: var(--text);
+	}
+	.option small {
+		display: block;
+		margin-top: 2px;
+		color: var(--text-2);
+	}
+	.confirm .error {
+		margin: 0 16px 10px;
+		font-size: 13px;
+		color: #ff3b30;
+	}
+	.buttons {
+		display: flex;
+		gap: 8px;
+		padding: 4px 16px 16px;
+	}
+	.buttons button {
+		flex: 1;
+		height: 40px;
+		border-radius: 10px;
+		font-size: 15px;
+		font-weight: 600;
+	}
+	.buttons button:disabled {
+		opacity: 0.5;
+	}
+	.secondary {
+		background: var(--fill);
+		color: var(--text);
+	}
+	.primary {
+		background: var(--accent);
+		color: #fff;
+	}
+	.destructive {
+		background: #ff3b30;
+		color: #fff;
+	}
+	.toast {
+		position: fixed;
+		z-index: 95;
+		left: 50%;
+		bottom: calc(var(--toast-offset, 24px) + env(safe-area-inset-bottom));
+		transform: translateX(-50%);
+		padding: 10px 18px;
+		border-radius: 999px;
+		font-size: 14px;
+		font-weight: 500;
+		color: var(--text);
+		background: var(--menu, rgba(32, 32, 35, 0.9));
+		box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
+		white-space: nowrap;
+		will-change: transform, opacity;
+	}
+</style>
