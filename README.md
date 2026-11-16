@@ -1,12 +1,5 @@
 # hify
 
-FLAC-first music app: the player from the hify fork, a small FastAPI backend, and
-accounts from the `netflix-clone` project (`GroupCalendarCompanion`).
-
-Playback order: **Eclipse FLAC bridge → YouTube Music**. Spotify (via `spotapi`) is
-the catalog for search, artists and albums. There is no local library, download
-engine, karaoke or admin panel.
-
 ## Layout
 
 ```
