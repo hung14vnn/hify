@@ -177,6 +177,7 @@ class StreamService:
         content_type: str,
         extra_headers: dict[str, str] | None = None,
     ) -> StreamingResponse:
+        range_match = re.match(r"^bytes=(\d+)-(\d+)?$", range_header.strip()) if range_header else None
         response, _ = await self._open(url, range_header)
         if response.status_code not in {200, 206}:
             await response.aclose()
@@ -186,8 +187,53 @@ class StreamService:
         }
         headers.setdefault("Content-Type", content_type)
         headers["Content-Encoding"] = "identity"
+        headers["Accept-Ranges"] = "bytes"
         if extra_headers:
             headers.update(extra_headers)
+
+        # If client requested a Range but upstream returned full 200 OK, slice on-the-fly to return 206
+        if range_match and response.status_code == 200:
+            total_str = response.headers.get("Content-Length")
+            total = int(total_str) if total_str and total_str.isdigit() else None
+            req_start = int(range_match.group(1))
+            req_end = int(range_match.group(2)) if range_match.group(2) else (total - 1 if total else None)
+
+            if req_start > 0 or req_end is not None:
+                status_code = 206
+                headers["Content-Range"] = f"bytes {req_start}-{req_end if req_end is not None else ''}/{total if total else '*'}"
+                if req_end is not None:
+                    headers["Content-Length"] = str(req_end - req_start + 1)
+
+                async def slice_body() -> AsyncIterator[bytes]:
+                    skipped = 0
+                    yielded = 0
+                    to_yield = (req_end - req_start + 1) if req_end is not None else None
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            if skipped < req_start:
+                                needed = req_start - skipped
+                                if len(chunk) <= needed:
+                                    skipped += len(chunk)
+                                    continue
+                                chunk = chunk[needed:]
+                                skipped = req_start
+                            if to_yield is not None:
+                                remaining = to_yield - yielded
+                                if remaining <= 0:
+                                    break
+                                if len(chunk) > remaining:
+                                    chunk = chunk[:remaining]
+                            yielded += len(chunk)
+                            yield chunk
+                    finally:
+                        await response.aclose()
+
+                return StreamingResponse(
+                    slice_body(),
+                    status_code=status_code,
+                    headers=headers,
+                    media_type=headers.get("Content-Type", content_type),
+                )
 
         async def body() -> AsyncIterator[bytes]:
             try:
@@ -208,14 +254,19 @@ class StreamService:
         url: str,
         content_type: str,
         extra_headers: dict[str, str] | None = None,
+        time_offset: float | None = None,
     ) -> StreamingResponse:
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg",
-            "-loglevel", "error",
+        cmd = ["ffmpeg", "-loglevel", "error"]
+        if time_offset and time_offset > 0:
+            cmd.extend(["-ss", f"{time_offset:.2f}"])
+        cmd.extend([
             "-i", url,
             "-c:a", "copy",
             "-f", "flac",
             "pipe:1",
+        ])
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -243,7 +294,7 @@ class StreamService:
         headers = {
             "Content-Type": content_type,
             "Content-Encoding": "identity",
-            "Accept-Ranges": "none",
+            "Accept-Ranges": "bytes",
         }
         if extra_headers:
             headers.update(extra_headers)
@@ -281,7 +332,11 @@ class StreamService:
     # --- public API --------------------------------------------------------
 
     async def stream(
-        self, song_id: str, range_header: str | None, user_id: str | None = None
+        self,
+        song_id: str,
+        range_header: str | None,
+        user_id: str | None = None,
+        time_offset: float | None = None,
     ) -> StreamingResponse:
         if song_id.startswith("kr-"):
             raise SubsonicError(70, "Karaoke is not available")
@@ -327,7 +382,7 @@ class StreamService:
                     quality_headers["X-Audio-Sample-Rate"] = str(flac.sample_rate)
                 if flac.is_dash:
                     return await self._proxy_ffmpeg(
-                        flac.url, flac.content_type, quality_headers
+                        flac.url, flac.content_type, quality_headers, time_offset=time_offset
                     )
                 return await self._proxy_direct(
                     flac.url, range_header, flac.content_type, quality_headers

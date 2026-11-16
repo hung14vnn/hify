@@ -150,7 +150,7 @@ def _external_ids(item: Mapping[str, Any]) -> dict[str, str]:
     return result
 
 
-def _track_item(value: Any) -> dict[str, Any]:
+def _track_item(value: Any, parent_album: dict[str, Any] | None = None) -> dict[str, Any]:
     item = _unwrap_data(value)
     album = _mapping(item.get("albumOfTrack") or item.get("album"))
     artists = _artist_items(item.get("artists"))
@@ -158,21 +158,26 @@ def _track_item(value: Any) -> dict[str, Any]:
         artists = _artist_items(item.get("firstArtist")) + _artist_items(item.get("otherArtists"))
     if not artists:
         artists = _artist_items(album.get("artists"))
+    if not artists and parent_album:
+        artists = _artist_items(parent_album.get("artists"))
 
     duration_ms = _duration_ms(item)
-    album_id = _spotify_id(album, "album")
-    album_date = _release_date(album)
-    album_item = {
-        "id": album_id,
-        "name": album.get("name", ""),
-        "artists": _artist_items(album.get("artists")) or artists,
-        "images": _images(album.get("coverArt")),
-        "release_date": album_date,
-        "album_type": str(album.get("type") or album.get("albumType") or "album").lower(),
-        "external_urls": (
-            {"spotify": f"https://open.spotify.com/album/{album_id}"} if album_id else {}
-        ),
-    }
+    if parent_album and (not album or not (album.get("coverArt") or album.get("images"))):
+        album_item = parent_album
+    else:
+        album_id = _spotify_id(album, "album")
+        album_date = _release_date(album)
+        album_item = {
+            "id": album_id,
+            "name": album.get("name", ""),
+            "artists": _artist_items(album.get("artists")) or artists,
+            "images": _images(album.get("coverArt")),
+            "release_date": album_date,
+            "album_type": str(album.get("type") or album.get("albumType") or "album").lower(),
+            "external_urls": (
+                {"spotify": f"https://open.spotify.com/album/{album_id}"} if album_id else {}
+            ),
+        }
     track_id = _spotify_id(item, "track")
     return {
         "id": track_id,
@@ -194,17 +199,31 @@ def _track_item(value: Any) -> dict[str, Any]:
 
 def _album_item(value: Any, track_values: list[Any] | None = None) -> dict[str, Any]:
     item = _unwrap_data(value)
+    album_id = _spotify_id(item, "album")
+    album_images = _images(item.get("coverArt"))
+    album_artists = _artist_items(item.get("artists"))
+    album_date = _release_date(item)
+    album_item = {
+        "id": album_id,
+        "name": item.get("name", ""),
+        "artists": album_artists,
+        "images": album_images,
+        "release_date": album_date,
+        "album_type": str(item.get("type") or item.get("albumType") or "album").lower(),
+        "external_urls": (
+            {"spotify": f"https://open.spotify.com/album/{album_id}"} if album_id else {}
+        ),
+    }
     tracks_data = _mapping(item.get("tracksV2") or item.get("tracks"))
     raw_tracks = track_values if track_values is not None else _items(tracks_data)
-    tracks = [_track_item(track) for track in raw_tracks]
-    album_id = _spotify_id(item, "album")
+    tracks = [_track_item(track, parent_album=album_item) for track in raw_tracks]
     return {
         "id": album_id,
         "name": item.get("name", ""),
         "album_type": str(item.get("type") or item.get("albumType") or "album").lower(),
-        "release_date": _release_date(item),
-        "images": _images(item.get("coverArt")),
-        "artists": _artist_items(item.get("artists")),
+        "release_date": album_date,
+        "images": album_images,
+        "artists": album_artists,
         "tracks": {
             "items": tracks,
             "total": int(tracks_data.get("totalCount") or len(tracks)),

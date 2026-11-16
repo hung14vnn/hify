@@ -305,6 +305,10 @@ class Player {
 	private karaokeSession: string | null = null;
 	/** Bumped when the same `kr-` id starts serving the AI stems instead of the vocal cut. */
 	private karaokeBust = 0;
+	/** Cache buster for stream URL reloads on seek or recovery. */
+	private streamBust = 0;
+	/** Time offset in seconds when streaming an unseekable/transcoded stream from a seek position. */
+	private streamOffset = 0;
 	/** Offline/prefetched copy now playing, revoked on the next change. */
 	private playingOffline: OfflineCopy | null = null;
 	/**
@@ -504,6 +508,12 @@ class Player {
 		a.addEventListener('timeupdate', () => {
 			if (this.audio === a) this.onTime();
 		});
+		a.addEventListener('seeked', () => {
+			if (this.audio === a) {
+				this.onTime();
+				this.updatePosition();
+			}
+		});
 		a.addEventListener('ended', () => {
 			if (this.audio === a) this.onEnded();
 		});
@@ -664,7 +674,7 @@ class Player {
 
 	previous() {
 		// Like every music app: restart the song unless we're within the first 3 seconds.
-		if (this.audio.currentTime > 3 || this.index <= 0) this.seek(0);
+		if (this.time > 3 || this.index <= 0) this.seek(0);
 		else this.load(this.index - 1, true);
 	}
 
@@ -672,8 +682,30 @@ class Player {
 		// Back from the last seconds: the next song isn't due yet (onTime starts it again).
 		this.cancelPreroll();
 		this.setTime(seconds);
-		if (this.audio.src) this.audio.currentTime = seconds;
-		else this.pendingSeek = seconds;
+		const a = this.audio;
+		const isFiniteDuration = Number.isFinite(a.duration) && a.duration > 0;
+		const isOfflineOrBlob = this.playingOffline || (a.src && a.src.startsWith('blob:'));
+
+		if (isOfflineOrBlob || isFiniteDuration) {
+			if (a.src) {
+				try {
+					a.currentTime = seconds;
+				} catch (e) {
+					logPlayback('seek-error', String(e));
+				}
+			} else {
+				this.pendingSeek = seconds;
+			}
+		} else if (this.current) {
+			// Stream has unknown/infinite duration (e.g. live remuxed pipe):
+			// Seek by requesting the stream from the server with timeOffset!
+			this.streamOffset = seconds;
+			const src = streamUrl(this.current.id, ++this.streamBust, seconds);
+			logPlayback('stream-seek', `id=${this.current.id} at=${seconds.toFixed(1)}`);
+			a.src = src;
+			a.load();
+			this.play();
+		}
 		this.updatePosition();
 	}
 
@@ -966,6 +998,7 @@ class Player {
 		}
 		const outgoing = this.playingOffline;
 		this.playingOffline = offline;
+		this.streamOffset = 0;
 		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0);
 		const handoff = autoplay && startAt === 0 && this.standbyHolds(src);
 
@@ -1536,12 +1569,13 @@ class Player {
 
 	private onTime() {
 		const a = this.audio;
-		this.time = a.currentTime;
+		if (a.seeking) return;
+		this.time = this.streamOffset + a.currentTime;
 		if (!document.hidden) this.currentTime = this.time;
 		const song = this.current;
 		const dur = this.duration || song?.duration || 0;
 		// Last.fm rule: scrobble after half the track or 4 minutes, whichever first.
-		if (song && !this.scrobbled && dur > 30 && (a.currentTime >= dur / 2 || a.currentTime >= 240)) {
+		if (song && !this.scrobbled && dur > 30 && (this.time >= dur / 2 || this.time >= 240)) {
 			this.scrobbled = true;
 			// Singing along isn't listening to the song: karaoke versions aren't scrobbled.
 			if (!song.karaokeOf) scrobble(song.id, true, song.coverArt);
@@ -1551,27 +1585,27 @@ class Player {
 			this.lastProgressAt = performance.now();
 		}
 		// It has played for a while: a later failure is a new incident and gets its own retry.
-		if (a.currentTime > ERROR_REARM_AFTER_S) this.errorRetriedFor = null;
+		if (this.time > ERROR_REARM_AFTER_S) this.errorRetriedFor = null;
 		// Resync the lock-screen position once per 5 s slot. (A `% 5` check stays true
 		// for a whole second, i.e. ~4 timeupdates, each a round trip to the OS.)
-		const slot = Math.floor(a.currentTime / 5);
+		const slot = Math.floor(this.time / 5);
 		if (slot !== this.lastPositionSlot) {
 			this.lastPositionSlot = slot;
 			this.updatePosition();
 		}
 		const upcoming = this.upcoming();
-		if (dur > 0 && upcoming && dur - a.currentTime <= blobLeadFor(upcoming.id)) void this.prefetchNextBlob();
+		if (dur > 0 && upcoming && dur - this.time <= blobLeadFor(upcoming.id)) void this.prefetchNextBlob();
 		// The real audio is over; don't sit through the silence up to the misread length.
 		// Switch straight to the next track without pausing: on a hidden iOS page a pause
 		// ends the audio session, and the next track then never gets past its metadata.
 		// load() clears durationCap synchronously, so this can't fire twice.
-		if (this.durationCap && !a.paused && a.currentTime >= this.durationCap - 0.25) {
+		if (this.durationCap && !a.paused && this.time >= this.durationCap - 0.25) {
 			logPlayback('capped-end', `cap=${this.durationCap} media=${a.duration}`);
 			this.onEnded();
 			return;
 		}
 		if (dur <= 0 || a.paused || this.repeat === 'one') return;
-		const remaining = dur - a.currentTime;
+		const remaining = dur - this.time;
 		if (remaining <= STREAM_STANDBY_LEAD_S) this.standbyNextStream();
 		const source = this.standbySource();
 		const ready = !!source && this.standbyHolds(source.url);

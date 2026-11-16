@@ -162,10 +162,19 @@ async def stream(request: Request, user=Depends(current_user)):
     song_id = request.query_params.get("id") or ""
     if not song_id:
         raise SubsonicError(70, "Song not found")
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    time_offset = request.query_params.get("timeOffset") or request.query_params.get("offset")
+    offset_s: float | None = None
+    if time_offset:
+        try:
+            offset_s = max(0.0, float(time_offset))
+        except (ValueError, TypeError):
+            offset_s = None
     return await services["stream"].stream(
         song_id,
-        request.headers.get("range") or request.headers.get("Range"),
+        range_header,
         user["user_id"],
+        time_offset=offset_s,
     )
 
 

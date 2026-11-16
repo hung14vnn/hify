@@ -338,6 +338,13 @@
 	// ---- mobile panel + FLIP ---------------------------------------------------
 	// Track the mobile breakpoint (matches the 900px CSS media query).
 	let isMobile = $state(false);
+	/** Phone in portrait: the cover is a hero image in the backdrop, not the art box. */
+	let isPortrait = $state(false);
+	/** Panel content mounts one frame after the animation starts, so a heavy
+		Queue/Lyrics mount can't delay the first frames on slow (Android) devices. */
+	let panelReady = $state(true);
+	let backdropEl = $state<HTMLDivElement | null>(null);
+	let heroAnims: Animation[] = [];
 	type Panel = "lyrics" | "queue";
 	// Single source of truth: is a panel open on mobile?
 	const mobileOpen = $derived(isMobile && !!ui.panel);
@@ -353,10 +360,18 @@
 
 	$effect(() => {
 		const mq = window.matchMedia("(max-width: 899px)");
-		const update = () => (isMobile = mq.matches);
+		const pq = window.matchMedia("(max-width: 899px) and (orientation: portrait)");
+		const update = () => {
+			isMobile = mq.matches;
+			isPortrait = pq.matches;
+		};
 		update();
 		mq.addEventListener("change", update);
-		return () => mq.removeEventListener("change", update);
+		pq.addEventListener("change", update);
+		return () => {
+			mq.removeEventListener("change", update);
+			pq.removeEventListener("change", update);
+		};
 	});
 
 	// Panel only uses opacity + transform, never touches layout.
@@ -372,6 +387,11 @@
 	// On leave: pull the panel out of the flow (absolute, keeping its old box) so the
 	// new layout applies immediately and FLIP can animate the rest.
 	function panelOut(node: HTMLElement, { duration = 350 } = {}) {
+		const comp = getComputedStyle(node);
+		const mask =
+			comp.maskImage ||
+			comp.webkitMaskImage ||
+			"linear-gradient(to bottom, #000 0%, #000 calc(100% - 200px), transparent calc(100% - 178px), transparent 100%)";
 		if (leaveBox) {
 			Object.assign(node.style, {
 				position: "absolute",
@@ -381,6 +401,9 @@
 				height: `${leaveBox.height}px`,
 				margin: "0",
 				pointerEvents: "none",
+				zIndex: "0",
+				maskImage: mask,
+				webkitMaskImage: mask,
 			});
 		}
 		return {
@@ -391,11 +414,109 @@
 		};
 	}
 
-	const FLIP_EASING = "cubic-bezier(0.2, 0.8, 0.2, 1)";
+	const FLIP_EASING = "cubic-bezier(0.25, 1, 0.4, 1)";
+	const FLIP_MS_OPEN = 600;
+	const FLIP_MS_CLOSE = 520;
+
+	/**
+	* Portrait phones: the big cover is the backdrop hero, the small cover is the
+	* art box. Opening a panel shrinks the hero into the thumbnail; closing grows
+	* it back. Single-element flight prevents any ghosting/double-image artifacts.
+	*/
+	function heroFlip(opening: boolean, wrapBefore?: DOMRect, layersBefore?: DOMRect) {
+		heroAnims.forEach((a) => a.cancel());
+		heroAnims = [];
+		if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+		const wrap = mainEl?.querySelector<HTMLElement>(".art-wrap");
+		const layers = mainEl?.querySelector<HTMLElement>(".art-layers");
+		const heroes = Array.from(
+			backdropEl?.querySelectorAll<HTMLElement>(".backdrop-art") ?? [],
+		);
+		if (!wrap || !layers || !heroes.length) return;
+
+		const h = heroes[0].getBoundingClientRect();
+		const thumb = opening ? layers.getBoundingClientRect() : layersBefore;
+		if (!thumb || h.width < 1 || h.height < 1 || thumb.width < 1) return;
+
+		const small = `translate3d(${thumb.left - h.left}px, ${thumb.top - h.top}px, 0) scale(${thumb.width / h.width}, ${thumb.height / h.height})`;
+		const full = "translate3d(0, 0, 0) scale(1, 1)";
+		const duration = opening ? FLIP_MS_OPEN : FLIP_MS_CLOSE;
+		const opts: KeyframeAnimationOptions = { duration, easing: FLIP_EASING };
+		const run = (el: HTMLElement, frames: Keyframe[]) => {
+			const anim = el.animate(frames, opts);
+			anim.onfinish = () => anim.cancel();
+			heroAnims.push(anim);
+		};
+
+		for (const hero of heroes) {
+			run(
+				hero,
+				opening
+					? [
+							{
+								offset: 0,
+								transformOrigin: "0 0",
+								transform: full,
+								borderRadius: "0px",
+								opacity: 1,
+							},
+							{
+								offset: 0.92,
+								transformOrigin: "0 0",
+								transform: small,
+								borderRadius: "6px",
+								opacity: 1,
+							},
+							{
+								offset: 1,
+								transformOrigin: "0 0",
+								transform: small,
+								borderRadius: "6px",
+								opacity: 0,
+							},
+						]
+					: [
+							{
+								offset: 0,
+								transformOrigin: "0 0",
+								transform: small,
+								borderRadius: "6px",
+								opacity: 1,
+							},
+							{
+								offset: 1,
+								transformOrigin: "0 0",
+								transform: full,
+								borderRadius: "0px",
+								opacity: 1,
+							},
+						],
+			);
+		}
+
+		if (opening) {
+			// Keep thumbnail hidden during flight so only the hero image moves;
+			// hand off right at the destination to eliminate any ghost/double image.
+			run(wrap, [
+				{ offset: 0, opacity: 0 },
+				{ offset: 0.9, opacity: 0 },
+				{ offset: 1, opacity: 1 },
+			]);
+		} else {
+			// Closing: thumbnail hides immediately so only the hero expands outward.
+			run(wrap, [
+				{ offset: 0, opacity: 0 },
+				{ offset: 1, opacity: 0 },
+			]);
+		}
+	}
 
 	async function flip(mutate: () => void) {
 		if (!mainEl) return mutate();
 
+		const portrait = isPortrait;
+		const wasOpen = mobileOpen;
 		const els = () =>
 			Array.from(mainEl!.querySelectorAll<HTMLElement>("[data-flip]"));
 
@@ -403,6 +524,12 @@
 		const first = new Map(
 			els().map((el) => [el.dataset.flip!, el.getBoundingClientRect()]),
 		);
+		const wrapBefore = mainEl
+			.querySelector<HTMLElement>(".art-wrap")
+			?.getBoundingClientRect();
+		const layersBefore = mainEl
+			.querySelector<HTMLElement>(".art-layers")
+			?.getBoundingClientRect();
 		const m = mainEl.getBoundingClientRect();
 		const p = panelEl?.getBoundingClientRect();
 		leaveBox = p
@@ -422,7 +549,14 @@
 		const rows = els();
 		rows.forEach((el) => el.getAnimations().forEach((a) => a.cancel()));
 
+		const heroToggle = portrait && wasOpen !== mobileOpen;
+		const opening = !wasOpen && mobileOpen;
+		const duration = opening ? FLIP_MS_OPEN : FLIP_MS_CLOSE;
+
 		for (const el of rows) {
+			// In portrait the art box is hidden while no panel is open, so it can't fly:
+			// the hero image does it instead (heroFlip).
+			if (heroToggle && el.dataset.flip === "art") continue;
 			const before = first.get(el.dataset.flip!);
 			if (!before) continue;
 			const after = el.getBoundingClientRect();
@@ -445,14 +579,20 @@
 					},
 					{ transform: "translate3d(0, 0, 0) scale(1, 1)" },
 				],
-				{ duration: 550, easing: FLIP_EASING },
+				{ duration, easing: FLIP_EASING },
 			);
 		}
+
+		if (heroToggle) heroFlip(!wasOpen, wrapBefore, layersBefore);
 	}
 
 	function toggleMobilePanel(panel: Panel) {
 		if (!isMobile) return ui.togglePanel(panel);
-		flip(() => ui.togglePanel(panel));
+		// Opening: mount the panel's content after the animation has started.
+		if (!ui.panel) panelReady = false;
+		flip(() => ui.togglePanel(panel)).finally(() =>
+			requestAnimationFrame(() => (panelReady = true)),
+		);
 	}
 
 	// Swipe-down-to-dismiss from anywhere in the Now Playing screen.
@@ -586,7 +726,10 @@
 
 			// Artwork: the cover flies between the mini player's thumbnail and the
 			// hero box, so both directions read as the same image moving.
-			const hero = node.querySelector<HTMLElement>(".backdrop-art");
+			// With a panel open (portrait) the big image is hidden; the thumbnail flies instead.
+			const hero = node.querySelector<HTMLElement>(
+				mobileOpen && isPortrait ? ".art-row .art-wrap" : ".backdrop-art",
+			);
 			const from = document
 				.querySelector<HTMLElement>("[data-np-art]")
 				?.getBoundingClientRect();
@@ -794,6 +937,7 @@
 	class="np"
 	class:tinted={!!displayTint}
 	class:closing={!ui.nowPlaying}
+	class:panel-open={mobileOpen}
 	style:--np-top={displayTint?.top}
 	style:--np-bottom={displayTint?.bottom}
 	style:--np-h="{npHeight}px"
@@ -810,10 +954,17 @@
 	aria-modal="true"
 	aria-label="Now Playing"
 >
-	<div class="backdrop" aria-hidden="true">
+	<div class="backdrop" bind:this={backdropEl} aria-hidden="true">
 		{#if currentDisplay}
 			{#key currentDisplay.id}
 				<div class="backdrop-layer active" out:backdropOut={{ duration: 450 }}>
+					{#if currentDisplay.tint}
+						<div
+							class="tint-flat"
+							style:--top={currentDisplay.tint.top}
+							style:--bottom={currentDisplay.tint.bottom}
+						></div>
+					{/if}
 					<img
 						class="backdrop-art"
 						src={coverUrl(currentDisplay.coverArt, 1200)}
@@ -828,7 +979,7 @@
 							style:--accent={currentDisplay.tint.accent ?? currentDisplay.tint.top}
 							style:--glow={currentDisplay.tint.glow ?? 'transparent'}
 						>
-							<div class="mesh-aura" class:paused={!player.playing} aria-hidden="true"></div>
+							<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
 						</div>
 					{/if}
 				</div>
@@ -837,6 +988,13 @@
 
 		{#if incomingDisplay}
 			<div class="backdrop-layer incoming" class:fading-in={incomingActive}>
+				{#if incomingDisplay.tint}
+					<div
+						class="tint-flat"
+						style:--top={incomingDisplay.tint.top}
+						style:--bottom={incomingDisplay.tint.bottom}
+					></div>
+				{/if}
 				<img
 					class="backdrop-art"
 					src={coverUrl(incomingDisplay.coverArt, 1200)}
@@ -851,7 +1009,7 @@
 						style:--accent={incomingDisplay.tint.accent ?? incomingDisplay.tint.top}
 						style:--glow={incomingDisplay.tint.glow ?? 'transparent'}
 					>
-						<div class="mesh-aura" class:paused={!player.playing} aria-hidden="true"></div>
+						<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
 					</div>
 				{/if}
 			</div>
@@ -990,7 +1148,9 @@
 					ontouchmove={panel === "lyrics" ? showControls : undefined}
 					onpointerdown={panel === "lyrics" ? showControls : undefined}
 				>
-					{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+					{#if panelReady}
+						{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+					{/if}
 				</div>
 			{/key}
 		{/snippet}
@@ -1002,7 +1162,7 @@
 				bind:this={mainEl}
 			>
 				<div class="art-row" class:mini={mobileOpen}>
-					<div class="art-wrap" data-flip="art">
+					<div class="art-wrap" class:has-art={!!currentDisplay?.coverArt} data-flip="art">
 						<div class="art" class:paused={!player.playing}>
 							<div class="art-layers">
 								{#if currentDisplay}
@@ -1386,9 +1546,7 @@
 		inset: 0;
 		z-index: 0;
 		opacity: 0;
-		background: rgb(0 0 0 / 0.5);
-		backdrop-filter: blur(26px);
-		-webkit-backdrop-filter: blur(26px);
+		background: rgb(0 0 0 / 0.16);
 		transition: opacity 0.35s ease;
 		pointer-events: none;
 	}
@@ -1433,9 +1591,14 @@
 	.np.closing {
 		background: var(--chrome-strong, rgba(30, 30, 30, 0.95));
 	}
-	.np.closing .tint {
+	.np.closing .tint,
+	.np.closing .tint-flat {
 		opacity: 0;
 		transition: none;
+	}
+	/* Flat tint shown instead of the cover while a panel is open (portrait only). */
+	.tint-flat {
+		display: none;
 	}
 	.mesh-aura {
 		position: absolute;
@@ -2165,7 +2328,22 @@
 			flex: 1;
 			min-height: 0;
 			width: auto;
-			margin: 0 -12px 10px;
+			margin: 0 -12px 0;
+			mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 200px),
+				transparent calc(100% - 178px),
+				transparent 100%
+			);
+			-webkit-mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 calc(100% - 200px),
+				transparent calc(100% - 178px),
+				transparent 100%
+			);
+			transition: mask-image 0.45s ease, -webkit-mask-image 0.45s ease;
 		}
 		.controls.panel-open {
 			flex: 0 0 auto;
@@ -2187,21 +2365,6 @@
 		}
 		.mobile-panel:has(.controls.overlay) .panel-mobile {
 			margin-bottom: 0;
-			mask-image: linear-gradient(
-				to bottom,
-				#000 0%,
-				#000 calc(100% - 200px),
-				transparent calc(100% - 178px),
-				transparent 100%
-			);
-			-webkit-mask-image: linear-gradient(
-				to bottom,
-				#000 0%,
-				#000 calc(100% - 200px),
-				transparent calc(100% - 178px),
-				transparent 100%
-			);
-			transition: mask-image 0.45s ease, -webkit-mask-image 0.45s ease;
 		}
 		.mobile-panel:has(.controls.overlay.controls-hidden) .panel-mobile {
 			mask-image: linear-gradient(
@@ -2253,8 +2416,8 @@
 			width: min(40vw, 440px);
 			justify-content: center;
 			transition:
-				width 0.45s cubic-bezier(0.2, 0.8, 0.2, 1),
-				transform 0.45s cubic-bezier(0.2, 0.8, 0.2, 1);
+				width 0.55s cubic-bezier(0.25, 1, 0.4, 1),
+				transform 0.55s cubic-bezier(0.25, 1, 0.4, 1);
 		}
 		.main.panel-shift {
 			transform: translateX(calc((min(48vw, 780px) + 10vw) / -2));
@@ -2287,16 +2450,13 @@
 		.grab :global(.dismiss) {
 			pointer-events: auto;
 		}
-		.layout {
-			transition: padding-top 0.25s ease;
-		}
 		.layout.mobile-panel {
 			padding-top: max(34px, env(safe-area-inset-top));
 		}
 		.art-row:not(.mini) {
 			padding-top: 0;
 		}
-		.art-row:not(.mini) .art-wrap {
+		.art-row:not(.mini) .art-wrap.has-art {
 			opacity: 0;
 			pointer-events: none;
 		}
@@ -2317,6 +2477,13 @@
 			mask-image: linear-gradient(to bottom, #000 0%, #000 86%, transparent 100%);
 		}
 		.tint {
+			background: none;
+		}
+		/* Hero state: transparent over the cover, tinted wash below. */
+		.tint::before {
+			content: "";
+			position: absolute;
+			inset: 0;
 			background: linear-gradient(
 				180deg,
 				rgb(0 0 0 / 0) 0%,
@@ -2324,6 +2491,31 @@
 				color-mix(in srgb, var(--top) 26%, rgb(0 0 0 / 0.25)) 56%,
 				color-mix(in srgb, var(--bottom) 62%, #000 38%) 100%
 			);
+			transition: opacity 0.55s ease;
+		}
+		/* Panel state: no cover behind, just one tint. Opacity only (compositor). */
+		.tint-flat {
+			display: block;
+			position: absolute;
+			inset: 0;
+			z-index: 0;
+			opacity: 0;
+			background: linear-gradient(
+				180deg,
+				color-mix(in srgb, var(--top) 70%, #000 30%) 0%,
+				color-mix(in srgb, var(--bottom) 62%, #000 38%) 100%
+			);
+			transition: opacity 0.55s ease;
+		}
+		.np.panel-open .tint-flat {
+			opacity: 1;
+		}
+		.np.panel-open .tint::before {
+			opacity: 0;
+		}
+		/* The cover is hidden while a panel is open; heroFlip animates it in/out. */
+		.np.panel-open .backdrop-art {
+			opacity: 0;
 		}
 	}
 

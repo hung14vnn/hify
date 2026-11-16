@@ -355,15 +355,36 @@ export async function login(opts: { server: string; username?: string; password?
 
 export function coverUrl(id: string | undefined, size = 300) {
 	if (!id) return undefined;
-	if (id.startsWith('http://') || id.startsWith('https://')) return id;
+	if (id.startsWith('http://') || id.startsWith('https://')) {
+		if (id.includes('googleusercontent.com') || id.includes('ggpht.com')) {
+			const target = Math.max(size, 800);
+			if (/=w\d+-h\d+/.test(id)) {
+				return id.replace(/=w\d+-h\d+[^?#]*/, `=w${target}-h${target}-l90-rj`);
+			}
+			if (/=s\d+/.test(id)) {
+				return id.replace(/=s\d+[^?#]*/, `=s${target}`);
+			}
+			if (!id.includes('=')) {
+				return `${id}=w${target}-h${target}-l90-rj`;
+			}
+		}
+		if (id.includes('i.ytimg.com') || id.includes('img.youtube.com')) {
+			return id.replace(/\/(default|mqdefault)\.jpg/, '/hqdefault.jpg');
+		}
+		return id;
+	}
 	if (!session) return undefined;
 	// Snap to a few sizes so the browser/SW cache is shared across views.
 	const snapped = [64, 150, 300, 600, 1200].find((n) => n >= size) ?? 1200;
 	return buildUrl(session, 'getCoverArt', { id, size: snapped });
 }
 
-export function streamUrl(id: string, bust?: number) {
-	return session ? buildUrl(session, 'stream', bust ? { id, _: bust } : { id }) : '';
+export function streamUrl(id: string, bust?: number, timeOffset?: number) {
+	if (!session) return '';
+	const params: Record<string, string | number> = { id };
+	if (bust) params._ = bust;
+	if (timeOffset && timeOffset > 0) params.timeOffset = Math.round(timeOffset * 100) / 100;
+	return buildUrl(session, 'stream', params);
 }
 
 /**

@@ -49,7 +49,14 @@
 {#await data}
 	<div class="spinner"></div>
 {:then { album, more, tint }}
-	{@const songs = (album.song ?? []).filter((s) => !ui.removedSongs.has(s.id))}
+	{@const songs = (album.song ?? [])
+		.filter((s) => !ui.removedSongs.has(s.id))
+		.map((s) => ({
+			...s,
+			coverArt: s.coverArt || album.coverArt,
+			album: s.album || album.name,
+			albumId: s.albumId || album.id
+		}))}
 	<div class="page album-page" style:--hero-bg={tint}>
 		<DetailHeader
 			coverArt={album.coverArt}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from providers.meta import remember
@@ -27,18 +28,18 @@ def _artist_names(artists: Any) -> list[str]:
     return [str(item.get("name")) for item in artists if isinstance(item, dict) and item.get("name")]
 
 
-def song_from_spotify(track: dict[str, Any]) -> dict[str, Any]:
-    album = track.get("album") if isinstance(track.get("album"), dict) else {}
+def song_from_spotify(track: dict[str, Any], *, album: dict[str, Any] | None = None) -> dict[str, Any]:
+    album_dict = album if isinstance(album, dict) and album else (track.get("album") if isinstance(track.get("album"), dict) else {})
     artists = track.get("artists") if isinstance(track.get("artists"), list) else []
     names = _artist_names(artists)
-    album_id = album.get("id")
+    album_id = album_dict.get("id")
     first_artist = artists[0] if artists and isinstance(artists[0], dict) else {}
     isrc = (track.get("external_ids") or {}).get("isrc")
     duration_ms = track.get("duration_ms")
     song = {
         "id": f"st-{track.get('id', '')}",
         "title": str(track.get("name") or ""),
-        "album": str(album.get("name") or ""),
+        "album": str(album_dict.get("name") or ""),
         "albumId": f"sl-{album_id}" if album_id else None,
         "artist": ", ".join(names) or "Unknown Artist",
         "artistId": f"sa-{first_artist.get('id')}" if first_artist.get("id") else None,
@@ -50,8 +51,8 @@ def song_from_spotify(track: dict[str, Any]) -> dict[str, Any]:
         ],
         "track": track.get("track_number"),
         "discNumber": track.get("disc_number"),
-        "year": _year(album.get("release_date")),
-        "coverArt": _image(album.get("images")),
+        "year": _year(album_dict.get("release_date")),
+        "coverArt": _image(album_dict.get("images")),
         "duration": int(round(duration_ms / 1000)) if duration_ms else None,
         "type": "music",
         "isDir": False,
@@ -78,7 +79,7 @@ def album_from_spotify(album: dict[str, Any], *, with_songs: bool = False) -> di
     }
     if with_songs:
         tracks = (album.get("tracks") or {}).get("items") or []
-        item["song"] = [song_from_spotify(track) for track in tracks if isinstance(track, dict)]
+        item["song"] = [song_from_spotify(track, album=album) for track in tracks if isinstance(track, dict)]
     return {key: value for key, value in item.items() if value is not None}
 
 
@@ -96,11 +97,37 @@ def artist_from_spotify(artist: dict[str, Any], *, albums: list[dict[str, Any]] 
     return {key: value for key, value in item.items() if value is not None}
 
 
+def _upgrade_yt_image_url(url: str) -> str:
+    if "googleusercontent.com" in url or "ggpht.com" in url:
+        if re.search(r"=w\d+-h\d+", url):
+            return re.sub(r"=w\d+-h\d+[^?#]*", "=w800-h800-l90-rj", url)
+        if re.search(r"=s\d+", url):
+            return re.sub(r"=s\d+[^?#]*", "=s800", url)
+        if "=" not in url:
+            return f"{url}=w800-h800-l90-rj"
+    elif "i.ytimg.com" in url or "img.youtube.com" in url:
+        return re.sub(r"/(default|mqdefault)\.jpg", "/hqdefault.jpg", url)
+    return url
+
+
 def _yt_image(thumbnails: Any) -> str | None:
     if isinstance(thumbnails, list) and thumbnails:
-        last = thumbnails[-1]
-        if isinstance(last, dict) and last.get("url"):
-            return str(last["url"])
+        best: str | None = None
+        max_dim = 0
+        for item in thumbnails:
+            if isinstance(item, dict) and item.get("url"):
+                w = item.get("width") or 0
+                h = item.get("height") or 0
+                dim = max(int(w) if isinstance(w, (int, float)) else 0, int(h) if isinstance(h, (int, float)) else 0)
+                if dim >= max_dim:
+                    max_dim = dim
+                    best = str(item["url"])
+        if not best:
+            last = thumbnails[-1]
+            if isinstance(last, dict) and last.get("url"):
+                best = str(last["url"])
+        if best:
+            return _upgrade_yt_image_url(best)
     return None
 
 

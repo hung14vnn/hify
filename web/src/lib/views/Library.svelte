@@ -11,14 +11,14 @@
 	import AlbumCard from '../components/AlbumCard.svelte';
 	import Icon from '../components/Icon.svelte';
 	import ProfileButton from '../components/ProfileButton.svelte';
-	import Shelf from '../components/Shelf.svelte';
 	import type { Album, Song } from '../types';
 
 	const rows = [
 		{ path: '/playlists', label: 'Playlists', icon: 'playlist' },
 		{ path: '/artists', label: 'Artists', icon: 'mic' },
 		{ path: '/albums', label: 'Albums', icon: 'album' },
-		{ path: '/songs', label: 'Songs', icon: 'note' }
+		{ path: '/songs', label: 'Songs', icon: 'note' },
+		{ path: '/downloads', label: 'Downloaded', icon: 'download' }
 	] as const;
 
 	const load = () =>
@@ -71,9 +71,12 @@
 		</ul>
 
 		{#if shelf.length}
-			<Shelf title={recentAlbums.length ? 'Recently Played' : 'Saved Albums'}>
-				{#each shelf as album (album.id)}<AlbumCard {album} />{/each}
-			</Shelf>
+			<section class="recent">
+				<h2 class="section-title">{recentAlbums.length ? 'Recently Played' : 'Saved Albums'}</h2>
+				<div class="grid recent-grid">
+					{#each shelf as album (album.id)}<AlbumCard {album} />{/each}
+				</div>
+			</section>
 		{:else}
 			<div class="empty">
 				<Icon name="note" size={44} />
@@ -125,6 +128,21 @@
 	}
 	.rows :global(.chev) {
 		color: var(--text-3);
+	}
+
+	.recent {
+		margin-bottom: 34px;
+	}
+	.section-title {
+		margin: 0 var(--gutter) 14px;
+		font-size: 20px;
+		font-weight: 700;
+		letter-spacing: -0.01em;
+		color: var(--text);
+	}
+	.recent-grid {
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		gap: 20px 14px;
 	}
 
 	.empty {
