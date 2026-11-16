@@ -19,9 +19,10 @@ import httpx
 
 from config import settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("music")
 
 _MANIFEST_TTL = 10 * 60.0
+_MANIFEST_ERROR_TTL = 10.0
 _RESOLVE_TTL = 30 * 60.0
 _URL_TTL = 10 * 60.0
 
@@ -35,6 +36,17 @@ class FlacStream:
     bit_depth: int | None = None
     sample_rate: int | None = None
     is_dash: bool = False
+
+
+def _clean_track_title(title: str) -> str:
+    # remove trailing noise like (Remastered...), [Explicit], (Single Version), etc.
+    t = re.sub(
+        r"\s*[\(\[](?:remastered|explicit|single|deluxe|bonus|anniversary|feat\.?|radio edit)[^\)\]]*[\)\]]",
+        "",
+        title,
+        flags=re.I,
+    )
+    return t.strip()
 
 
 def _norm(value: Any) -> str:
@@ -134,6 +146,16 @@ class FlacBridge:
         except (httpx.HTTPError, ValueError):
             return None
 
+    async def warm_manifests(self) -> None:
+        """Prefetch manifests for configured add-ons in background."""
+        for base in self._addons:
+            try:
+                m = await self._manifest(base)
+                if m:
+                    logger.info("flac_bridge: warmed manifest for %s (id=%s)", base, m.get("id"))
+            except Exception as exc:
+                logger.warning("flac_bridge: warm manifest failed for %s: %s", base, exc)
+
     async def _manifest(self, base: str) -> dict[str, Any] | None:
         now = time.monotonic()
         cached = self._manifests.get(base)
@@ -143,17 +165,24 @@ class FlacBridge:
         if data is not None and isinstance(data.get("resources"), list):
             resources = {str(item) for item in data["resources"]}
             data = {**data, "resources": resources}
-        else:
-            data = None
-        self._manifests[base] = (now + _MANIFEST_TTL, data)
-        return data
+            self._manifests[base] = (now + _MANIFEST_TTL, data)
+            return data
+        # Never cache failure for 10 minutes; retry quickly on failure
+        self._manifests[base] = (now + _MANIFEST_ERROR_TTL, None)
+        return None
 
     @staticmethod
     def _match(
         title: str, artist: str, duration_s: float | None, item: dict[str, Any]
     ) -> bool:
-        if _norm(item.get("title") or item.get("name")) != _norm(title):
-            return False
+        item_title = _norm(item.get("title") or item.get("name"))
+        req_title = _norm(title)
+        if item_title != req_title:
+            clean_item = _norm(_clean_track_title(item.get("title") or item.get("name") or ""))
+            clean_req = _norm(_clean_track_title(title))
+            if clean_item != clean_req and not (clean_req and (clean_req in clean_item or clean_item in clean_req)):
+                return False
+
         candidate_artists = item.get("artists")
         if isinstance(candidate_artists, list) and candidate_artists:
             names = [
@@ -162,8 +191,10 @@ class FlacBridge:
             ]
         else:
             names = [_norm(item.get("artist"))]
-        if _norm(artist) not in names and not any(_norm(artist) in name for name in names if name):
+        norm_art = _norm(artist)
+        if norm_art not in names and not any((norm_art in name or (name and name in norm_art)) for name in names if name):
             return False
+
         candidate_duration = item.get("durationMs")
         if candidate_duration is None and item.get("duration") is not None:
             try:

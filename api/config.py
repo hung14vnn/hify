@@ -49,8 +49,8 @@ class Settings:
     eclipse_addons: tuple[str, ...] = _csv("ECLIPSE_ADDON_URLS")
     eclipse_bearer_token: str = _env("ECLIPSE_BEARER_TOKEN", "")
     eclipse_quality: str = _env("ECLIPSE_QUALITY", "HI_RES_LOSSLESS")
-    eclipse_duration_tolerance_s: float = _env_float("ECLIPSE_DURATION_TOLERANCE_S", 8.0)
-    eclipse_timeout_s: float = _env_float("ECLIPSE_TIMEOUT_S", 8.0)
+    eclipse_duration_tolerance_s: float = _env_float("ECLIPSE_DURATION_TOLERANCE_S", 15.0)
+    eclipse_timeout_s: float = _env_float("ECLIPSE_TIMEOUT_S", 15.0)
     # Local add-ons (or a LAN server) are loopback/private; only enable in dev.
     allow_private_stream_hosts: bool = _env_bool("ALLOW_PRIVATE_STREAM_HOSTS", False)
 

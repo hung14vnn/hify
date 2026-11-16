@@ -42,6 +42,7 @@ async def lifespan(app: FastAPI):
     spotify = SpotApiClient()
     ytmusic = YTMusicStreamService(http)
     flac = FlacBridge(http)
+    asyncio.create_task(flac.warm_manifests())
     app.state.services = {
         "http": http,
         "spotify": spotify,
