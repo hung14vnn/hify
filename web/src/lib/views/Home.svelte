@@ -8,6 +8,8 @@
 		getRecentlyPlayedSongs,
 		getTodaysHits,
 		getTrendingSongs,
+		getTrendingPlaylists,
+		getYtMusicNewReleases,
 		optional,
 	} from "../api";
 	import AlbumCard from "../components/AlbumCard.svelte";
@@ -15,6 +17,7 @@
 	import ErrorState from "../components/ErrorState.svelte";
 	import Icon from "../components/Icon.svelte";
 	import ProfileButton from "../components/ProfileButton.svelte";
+	import PlaylistCard from "../components/PlaylistCard.svelte";
 	import Shelf from "../components/Shelf.svelte";
 	import SongCard from "../components/SongCard.svelte";
 	import TrackList from "../components/TrackList.svelte";
@@ -81,7 +84,7 @@
 
 	// Charts come from YouTube Music / Spotify and can be slow on a cold cache, so
 	// they load on their own and never hold back (or break) the library shelves.
-	const region = /-([A-Z]{2})/.exec(navigator.language)?.[1];
+	const region = /-([A-Z]{2})\b/i.exec(navigator.language)?.[1]?.toUpperCase();
 	let trending = $state(
 		optional(
 			cachedNow(`home:trending:12:${region ?? ""}`, () => getTrendingSongs(12, region), {
@@ -90,7 +93,17 @@
 		),
 	);
 	let hits = $state(
-		optional(cachedNow("home:hits:12", () => getTodaysHits(12), { refresh: (list) => (hits = list) })),
+		optional(cachedNow("home:hits:spotify:12", () => getTodaysHits(12), { refresh: (list) => (hits = list) })),
+	);
+	let newReleases = $state(
+		optional(cachedNow("home:new-releases", () => getYtMusicNewReleases(20), {
+			refresh: (list) => (newReleases = list),
+		})),
+	);
+	let popularPlaylists = $state(
+		optional(cachedNow("home:popular-playlists", () => getTrendingPlaylists(), {
+			refresh: (list) => (popularPlaylists = list),
+		})),
 	);
 
 	// Personal picks from the user's Last.fm history (empty when not linked). A cold
@@ -241,6 +254,20 @@
 		{/if}
 	{:catch error}
 		<ErrorState {error} retry={() => (data = load())} />
+	{/await}
+	{#await popularPlaylists then list}
+		{#if list.length}
+			<Shelf title="Popular Playlists">
+				{#each list as playlist (playlist.id)}<PlaylistCard {playlist} />{/each}
+			</Shelf>
+		{/if}
+	{/await}
+	{#await newReleases then list}
+		{#if list.length}
+			<Shelf title="New Releases" size="lg">
+				{#each list as album (album.id)}<AlbumCard {album} />{/each}
+			</Shelf>
+		{/if}
 	{/await}
 </div>
 

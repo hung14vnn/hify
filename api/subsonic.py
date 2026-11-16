@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import logging
 import random
+import re
 import time
 from typing import Any
 from urllib.parse import quote
@@ -322,10 +324,56 @@ async def get_top_songs(request: Request, user=Depends(current_user)) -> JSONRes
 # --- home shelves -----------------------------------------------------------
 
 
-async def _chart_songs(services: dict[str, Any], count: int) -> list[dict[str, Any]]:
+_TODAYS_TOP_HITS = "37i9dQZF1DXcBWIGoYBM5M"
+_NEW_MUSIC_FRIDAY = "37i9dQZF1DX4JAvHpjipBk"
+_POPULAR_PLAYLISTS = (
+    "37i9dQZEVXbMDoHDwVN2tF",
+    "37i9dQZEVXbLdGSmz6xilI",
+    _TODAYS_TOP_HITS,
+    "37i9dQZF1DX4g8Gs5nUhpp",
+    "37i9dQZF1DXbYM3nMM0oPk",
+    "37i9dQZF1DX0XUsuxWHRQd",
+    "37i9dQZF1DWUa8ZRTfalHk",
+    "37i9dQZF1DWWQRwui0ExPn",
+)
+_DISCOVERY_IDS = (*_POPULAR_PLAYLISTS, _NEW_MUSIC_FRIDAY)
+_DISCOVERY_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_DISCOVERY_LOCKS = {playlist_id: asyncio.Lock() for playlist_id in _DISCOVERY_IDS}
+
+
+async def _discovery_playlist(spotify: SpotApiClient, playlist_id: str) -> dict[str, Any]:
+    async with _DISCOVERY_LOCKS[playlist_id]:
+        cached = _DISCOVERY_CACHE.get(playlist_id)
+        if cached and time.monotonic() - cached[0] < 3600:
+            return cached[1]
+        playlist = await spotify.get_playlist(playlist_id)
+        if playlist.get("_tracks"):
+            _DISCOVERY_CACHE[playlist_id] = (time.monotonic(), playlist)
+        return playlist
+
+
+def _spotify_playlist_json(playlist: dict[str, Any], *, with_songs: bool = False) -> dict[str, Any]:
+    tracks = [track for track in playlist.get("_tracks") or [] if track.get("id")]
+    images = playlist.get("images") or ((tracks[0].get("album") or {}).get("images") if tracks else []) or []
+    result = {
+        "id": f"spotify-playlist-{playlist['id']}",
+        "name": playlist.get("name") or "Spotify Playlist",
+        "owner": "Spotify",
+        "public": True,
+        "comment": playlist.get("description") or "",
+        "songCount": len(tracks),
+        "duration": sum(round((track.get("duration_ms") or 0) / 1000) for track in tracks),
+        "coverArt": images[0].get("url") if images else None,
+    }
+    if with_songs:
+        result["entry"] = [song_from_spotify(track) for track in tracks]
+    return result
+
+
+async def _chart_songs(services: dict[str, Any], count: int, country: str | None = None) -> list[dict[str, Any]]:
     ytmusic: YTMusicStreamService = services["ytmusic"]
     try:
-        tracks = await ytmusic.get_chart_songs(settings.yt_country, limit=count)
+        tracks = await ytmusic.get_chart_songs(country or settings.yt_country, limit=count)
     except Exception as exc:  # noqa: BLE001 - a dead chart never breaks Home
         logger.warning("chart songs failed: %s", exc)
         return []
@@ -334,14 +382,23 @@ async def _chart_songs(services: dict[str, Any], count: int) -> list[dict[str, A
 
 @router.get("/getTodaysHits")
 async def todays_hits(request: Request, user=Depends(current_user)) -> JSONResponse:
-    count = _int(request.query_params.get("count"), 20)
-    return _ok(todaysHits={"song": await _chart_songs(_services(request), count)})
+    count = max(1, min(_int(request.query_params.get("count"), 20), 100))
+    try:
+        playlist = await _discovery_playlist(_services(request)["spotify"], _TODAYS_TOP_HITS)
+        songs = [song_from_spotify(track) for track in playlist.get("_tracks") or [] if track.get("id")]
+    except Exception as exc:
+        logger.warning("Today's Top Hits failed: %s", exc)
+        songs = []
+    return _ok(todaysHits={"song": songs[:count]})
 
 
 @router.get("/getTrendingSongs")
 async def trending_songs(request: Request, user=Depends(current_user)) -> JSONResponse:
-    count = _int(request.query_params.get("count"), 20)
-    return _ok(trendingSongs={"song": await _chart_songs(_services(request), count)})
+    count = max(1, min(_int(request.query_params.get("count"), 20), 100))
+    country = (request.query_params.get("country") or settings.yt_country).strip().upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        country = settings.yt_country
+    return _ok(trendingSongs={"song": await _chart_songs(_services(request), count, country)})
 
 
 @router.get("/getRandomSongs")
@@ -377,12 +434,36 @@ async def songs_by_genre(request: Request, user=Depends(current_user)) -> JSONRe
 
 @router.get("/getTrendingPlaylists")
 async def trending_playlists(request: Request, user=Depends(current_user)) -> JSONResponse:
-    return _ok(playlists={"playlist": []})
+    spotify = _services(request)["spotify"]
+
+    async def fetch(playlist_id: str) -> dict[str, Any] | None:
+        try:
+            return _spotify_playlist_json(await _discovery_playlist(spotify, playlist_id))
+        except Exception as exc:
+            logger.warning("Popular playlist %s failed: %s", playlist_id, exc)
+            return None
+
+    playlists = await asyncio.gather(*(fetch(playlist_id) for playlist_id in _POPULAR_PLAYLISTS))
+    return _ok(playlists={"playlist": [playlist for playlist in playlists if playlist]})
 
 
 @router.get("/getYtMusicNewReleases")
 async def yt_new_releases(request: Request, user=Depends(current_user)) -> JSONResponse:
-    return _ok(albumList2={"album": []})
+    count = max(1, min(_int(request.query_params.get("count"), 20), 100))
+    try:
+        playlist = await _discovery_playlist(_services(request)["spotify"], _NEW_MUSIC_FRIDAY)
+    except Exception as exc:
+        logger.warning("New Music Friday failed: %s", exc)
+        return _ok(albumList2={"album": []})
+    albums = {}
+    for track in playlist.get("_tracks") or []:
+        album = track.get("album") or {}
+        album_id = album.get("id")
+        if album_id and album_id not in albums:
+            albums[album_id] = album_from_spotify(album)
+        if len(albums) >= count:
+            break
+    return _ok(albumList2={"album": list(albums.values())})
 
 
 @router.get("/getRandomRadioMix")
@@ -423,6 +504,20 @@ async def get_playlists(request: Request, user=Depends(current_user)) -> JSONRes
 @router.get("/getPlaylist")
 async def get_playlist(request: Request, user=Depends(current_user)) -> JSONResponse:
     playlist_id = request.query_params.get("id") or ""
+    if playlist_id.startswith("spotify-playlist-"):
+        spotify_id = playlist_id.removeprefix("spotify-playlist-")
+        if not re.fullmatch(r"[A-Za-z0-9]{22}", spotify_id):
+            raise SubsonicError(70, "Playlist not found")
+        spotify = _services(request)["spotify"]
+        try:
+            if spotify_id in _DISCOVERY_IDS:
+                playlist = await _discovery_playlist(spotify, spotify_id)
+            else:
+                playlist = await spotify.get_playlist(spotify_id)
+        except Exception as exc:
+            logger.warning("Spotify playlist %s failed: %s", spotify_id, exc)
+            raise SubsonicError(70, "Spotify playlist is unavailable. Try again later.") from exc
+        return _ok(playlist=_spotify_playlist_json(playlist, with_songs=True))
     full = await db.playlist(playlist_id, user["user_id"])
     if not full:
         raise SubsonicError(70, "Playlist not found")

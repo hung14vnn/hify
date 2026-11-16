@@ -458,8 +458,8 @@ export async function getTrendingSongs(count = 20, country?: string) {
 	return (r.trendingSongs?.song ?? []) as Song[];
 }
 
-export async function getTrendingPlaylists(country?: string) {
-	const r = await call('getTrendingPlaylists', { country });
+export async function getTrendingPlaylists() {
+	const r = await call('getTrendingPlaylists');
 	return (r.playlists?.playlist ?? []) as Playlist[];
 }
 
@@ -476,29 +476,6 @@ export async function getRandomSongs(size = 50, extra: Params = {}) {
 export async function getRecentlyPlayedSongs(count = 30, offset = 0) {
 	const r = await call('getRecentlyPlayedSongs', { count, offset });
 	return (r.recentlyPlayedSongs?.song ?? []) as Song[];
-}
-
-export async function getRandomRadioMix(count = 20, force = false) {
-	const key = 'cachedRadioMix';
-	if (!force) {
-		const cached = localStorage.getItem(key);
-		if (cached) {
-			try {
-				const { timestamp, data } = JSON.parse(cached);
-				if (Date.now() - timestamp < 24 * 60 * 60 * 1000) {
-					return data as Playlist[];
-				}
-			} catch (e) {
-				// ignore
-			}
-		}
-	}
-	const r = await call('getRandomRadioMix', { count });
-	const data = (r.randomRadioMix?.playlist ?? []) as Playlist[];
-	if (data.length > 0) {
-		localStorage.setItem(key, JSON.stringify({ timestamp: Date.now(), data }));
-	}
-	return data;
 }
 
 export async function getSongsByGenre(genre: string, count = 100, offset = 0) {

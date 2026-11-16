@@ -1,106 +1,21 @@
 <script lang="ts">
-	import {
-		allNow,
-		cachedNow,
-		getAlbumList,
-		getYtMusicNewReleases,
-		getGenres,
-		optional,
-		getRandomRadioMix,
-		getTrendingPlaylists,
-	} from "../api";
-	import PlaylistCard from "../components/PlaylistCard.svelte";
-	import RadioMixCard from "../components/RadioMixCard.svelte";
-	import AlbumCard from "../components/AlbumCard.svelte";
-	import ErrorState from "../components/ErrorState.svelte";
-	import GenreTiles from "../components/GenreTiles.svelte";
-	import Shelf from "../components/Shelf.svelte";
+	import { cachedNow, getGenres } from '../api';
+	import ErrorState from '../components/ErrorState.svelte';
+	import GenreTiles from '../components/GenreTiles.svelte';
 
-	// Cached so switching tabs back to Browse renders instantly (see `cachedNow` in api.ts).
-	// Synchronous on a revisit (plain values), so the tab paints without a spinner.
 	function load() {
-		const parts = allNow([
-			cachedNow("browse:yt-new", () => getYtMusicNewReleases(20)),
-			optional(cachedNow("browse:frequent", () => getAlbumList("frequent", 20))),
-			optional(cachedNow("browse:random", () => getAlbumList("random", 20))),
-			optional(cachedNow("genres", () => getGenres())),
-		]);
-		const assemble = ([newest, frequent, random, genres]: Awaited<typeof parts>) => ({
-			newest,
-			frequent,
-			random,
-			genres,
-		});
-		return parts instanceof Promise ? parts.then(assemble) : assemble(parts);
+		return cachedNow('genres', () => getGenres());
 	}
-	let data = $state(load());
-
-	const region = /-([A-Z]{2}) /.exec(navigator.language)?.[1];
-	let radioMix = $state(optional(getRandomRadioMix(5)));
-	const trendingPlaylists = optional(
-		cachedNow(`browse:trending:${region ?? ""}`, () => getTrendingPlaylists(region)),
-	);
-
-	function reloadRadioMix() {
-		radioMix = optional(getRandomRadioMix(5, true));
-	}
+	let genres = $state(load());
 </script>
 
 <div class="page">
 	<h1 class="page-title">Browse</h1>
-	{#await data}
+	{#await genres}
 		<div class="spinner"></div>
-	{:then d}
-		{#if d.newest.length}
-			<Shelf title="New Releases" size="lg">
-				{#each d.newest as album (album.id)}<AlbumCard {album} />{/each}
-			</Shelf>
-		{/if}
-		{#await trendingPlaylists then list}
-			{#if list.length}
-				<Shelf title="Trending Playlists">
-					{#each list as playlist (playlist.id)}<PlaylistCard
-							{playlist}
-						/>{/each}
-				</Shelf>
-			{/if}
-		{/await}
-		{#await radioMix}
-			<Shelf title="Radio Mix" size="lg">
-				{#each Array(5) as _}
-					<RadioMixCard skeleton={true} />
-				{/each}
-			</Shelf>
-		{:then list}
-			{#if list.length}
-				<Shelf title="Radio Mix" size="lg" onRefresh={reloadRadioMix}>
-					{#each list as playlist (playlist.id)}<RadioMixCard
-							{playlist}
-						/>{/each}
-				</Shelf>
-			{/if}
-		{/await}
-		{#if d.frequent.length}
-			<Shelf title="Most Played">
-				{#each d.frequent as album (album.id)}<AlbumCard
-						{album}
-					/>{/each}
-			</Shelf>
-		{/if}
-		{#if d.genres.length}
-			<h2 class="section-title"><a href="#/genres">Genres</a></h2>
-			<GenreTiles genres={d.genres.slice(0, 12)} />
-		{/if}
-		{#if d.random.length}
-			<div style="height: 30px"></div>
-			<Shelf title="Something Different" seeAll="#/albums">
-				{#each d.random as album (album.id)}<AlbumCard {album} />{/each}
-			</Shelf>
-		{/if}
+	{:then list}
+		<GenreTiles genres={list} />
 	{:catch error}
-		<ErrorState {error} retry={() => (data = load())} />
+		<ErrorState {error} retry={() => (genres = load())} />
 	{/await}
 </div>
-
-<style>
-</style>

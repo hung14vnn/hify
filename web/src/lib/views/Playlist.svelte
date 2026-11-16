@@ -14,6 +14,7 @@
 
 	let { id }: { id: string } = $props();
 	const player = getPlayer();
+	const isCatalog = $derived(id.startsWith('spotify-playlist-'));
 
 	// Like the album page: the cover's tint colours the whole page on phones.
 	// The tint is memoised per cover, so a revisit resolves synchronously when the cover does.
@@ -47,7 +48,7 @@
 
 	const menu = (playlist: Playlist) => [
 		...playlistMenu(playlist),
-		{ label: 'Delete Playlist', icon: 'trash', danger: true, action: () => destroy(playlist.name) }
+		...(!isCatalog ? [{ label: 'Delete Playlist', icon: 'trash' as const, danger: true, action: () => destroy(playlist.name) }] : [])
 	];
 
 	async function destroy(name: string) {
@@ -99,14 +100,14 @@
 			<div class="pad">
 				<TrackList
 					{songs}
-					extraMenu={(song, i) => [{ label: 'Remove from Playlist', icon: 'trash', danger: true, action: () => remove(song, i) }]}
+					extraMenu={isCatalog ? undefined : (song, i) => [{ label: 'Remove from Playlist', icon: 'trash', danger: true, action: () => remove(song, i) }]}
 				/>
 			</div>
 		{:else}
 			<div class="empty-state">
 				<Icon name="playlist" size={44} />
 				<h3>This playlist is empty</h3>
-				<p>Use “Add to Playlist…” on any song or album.</p>
+				{#if !isCatalog}<p>Use “Add to Playlist…” on any song or album.</p>{/if}
 			</div>
 		{/if}
 	</div>
