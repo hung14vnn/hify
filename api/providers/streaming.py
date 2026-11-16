@@ -203,6 +203,58 @@ class StreamService:
             media_type=headers.get("Content-Type", content_type),
         )
 
+    async def _proxy_ffmpeg(
+        self,
+        url: str,
+        content_type: str,
+        extra_headers: dict[str, str] | None = None,
+    ) -> StreamingResponse:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg",
+            "-loglevel", "error",
+            "-i", url,
+            "-c:a", "copy",
+            "-f", "flac",
+            "pipe:1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        async def body() -> AsyncIterator[bytes]:
+            try:
+                while True:
+                    chunk = await proc.stdout.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            except (asyncio.CancelledError, GeneratorExit):
+                pass
+            finally:
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+
+        headers = {
+            "Content-Type": content_type,
+            "Content-Encoding": "identity",
+            "Accept-Ranges": "none",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+
+        return StreamingResponse(
+            body(),
+            status_code=200,
+            headers=headers,
+            media_type=content_type,
+        )
+
     async def _proxy_yt(self, video_id: str, range_header: str | None) -> StreamingResponse:
         last_error: Exception | None = None
         for attempt in range(3):
@@ -268,15 +320,19 @@ class StreamService:
         )
         if flac:
             try:
-                quality: dict[str, str] = {}
+                quality_headers: dict[str, str] = {}
                 if flac.bit_depth:
-                    quality["X-Audio-Bit-Depth"] = str(flac.bit_depth)
+                    quality_headers["X-Audio-Bit-Depth"] = str(flac.bit_depth)
                 if flac.sample_rate:
-                    quality["X-Audio-Sample-Rate"] = str(flac.sample_rate)
+                    quality_headers["X-Audio-Sample-Rate"] = str(flac.sample_rate)
+                if flac.is_dash:
+                    return await self._proxy_ffmpeg(
+                        flac.url, flac.content_type, quality_headers
+                    )
                 return await self._proxy_direct(
-                    flac.url, range_header, flac.content_type, quality
+                    flac.url, range_header, flac.content_type, quality_headers
                 )
-            except (httpx.HTTPError, ValueError, SubsonicError) as exc:
+            except (httpx.HTTPError, ValueError, SubsonicError, OSError) as exc:
                 logger.warning("flac_bridge: proxy failed, falling back to YT: %s", exc)
         if is_yt:
             return await self._proxy_yt(song_id[3:], range_header)

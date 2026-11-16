@@ -34,6 +34,7 @@ class FlacStream:
     provider: str
     bit_depth: int | None = None
     sample_rate: int | None = None
+    is_dash: bool = False
 
 
 def _norm(value: Any) -> str:
@@ -79,14 +80,53 @@ class FlacBridge:
         self._manifests: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._resolved: dict[str, tuple[float, str, str]] = {}
         self._urls: dict[str, tuple[float, FlacStream]] = {}
+        self._access_tokens: dict[str, tuple[float, str]] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self._addons)
 
-    async def _json(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    async def _get_access_token(self, addon_id: str) -> str | None:
+        if not settings.eclipse_bearer_token:
+            return None
+        now = time.monotonic()
+        cached = self._access_tokens.get(addon_id)
+        if cached and cached[0] > now:
+            return cached[1]
         try:
-            response = await self._http.get(url, params=params, timeout=settings.eclipse_timeout_s)
+            resp = await self._http.post(
+                "https://api.eclipsemusic.app/api/addon-access/token",
+                params={"addon": addon_id},
+                headers={"Authorization": f"Bearer {settings.eclipse_bearer_token}"},
+                timeout=settings.eclipse_timeout_s,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("token")
+                expires_in = float(data.get("expiresIn") or 300)
+                ttl = max(60.0, expires_in - 30.0)
+                self._access_tokens[addon_id] = (now + ttl, token)
+                return token
+            logger.warning("Failed to fetch Eclipse access token: %s %s", resp.status_code, resp.text)
+        except Exception as exc:
+            logger.warning("Failed to fetch Eclipse access token: %s", exc)
+        return None
+
+    async def _json(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+        addon_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        headers = {}
+        if addon_id:
+            token = await self._get_access_token(addon_id)
+            if token:
+                headers["X-Eclipse-Access"] = token
+        try:
+            response = await self._http.get(
+                url, params=params, headers=headers if headers else None, timeout=settings.eclipse_timeout_s
+            )
             if response.status_code >= 400:
                 return None
             data = response.json()
@@ -141,12 +181,13 @@ class FlacBridge:
     async def _track_id(
         self, base: str, manifest: dict[str, Any], artist: str, title: str, duration_s: float | None
     ) -> str | None:
+        addon_id = manifest.get("id")
         resources: set[str] = manifest.get("resources") or set()
         if "resolve" in resources:
             params = {"title": title, "artist": artist}
             if duration_s:
                 params["durationMs"] = int(duration_s * 1000)
-            data = await self._json(base + "/resolve", params)
+            data = await self._json(base + "/resolve", params, addon_id=addon_id)
             if data:
                 item = data.get("item") or data.get("track") or data.get("result")
                 if isinstance(item, dict) and item.get("id") and self._match(title, artist, duration_s, item):
@@ -156,7 +197,7 @@ class FlacBridge:
                     if isinstance(item, dict) and item.get("id") and self._match(title, artist, duration_s, item):
                         return str(item["id"])
         if "search" in resources:
-            data = await self._json(base + "/search", {"q": f"{artist} {title}"})
+            data = await self._json(base + "/search", {"q": f"{artist} {title}"}, addon_id=addon_id)
             tracks = data.get("tracks") if data else None
             if isinstance(tracks, list):
                 for item in tracks:
@@ -180,30 +221,38 @@ class FlacBridge:
         return current
 
     async def _stream_url(
-        self, base: str, track_id: str, quality: str
+        self, base: str, track_id: str, quality: str, addon_id: str | None = None
     ) -> FlacStream | None:
         key = f"{base}|{track_id}|{quality}"
         now = time.monotonic()
         cached = self._urls.get(key)
         if cached and cached[0] > now:
             return cached[1]
-        data = await self._json(f"{base}/stream/{track_id}", {"quality": quality})
+        data = await self._json(f"{base}/stream/{track_id}", {"quality": quality}, addon_id=addon_id)
         if not data:
             return None
         stream = self._unwrap(data)
-        if stream.get("manifest") and str(stream.get("manifest")).lower() != "none":
-            return None
         url = str(stream.get("url") or stream.get("streamURL") or stream.get("streamUrl") or "")
         if not re.match(r"^https?://", url, re.I):
             return None
-        if re.search(r"\.(m3u8|mpd)(?:[?#]|$)", url, re.I):
-            return None
+
+        is_dash = bool(
+            re.search(r"\.(m3u8|mpd)(?:[?#]|$)", url, re.I)
+            or str(stream.get("manifest") or "").lower() in {"dash", "hls"}
+        )
+        if not is_dash:
+            if stream.get("manifest") and str(stream.get("manifest")).lower() != "none":
+                return None
+
         codec = str(stream.get("codec") or "").lower()
         fmt = str(stream.get("format") or "").lower()
         container = str(stream.get("container") or "").lower()
         content_type = _content_type(codec, fmt, container, url)
         if content_type is None:
-            return None
+            if is_dash and ("flac" in fmt or "flac" in codec or "flac" in container):
+                content_type = "audio/flac"
+            else:
+                return None
         lossless = content_type == "audio/flac"
         if quality.upper() in {"HI_RES_LOSSLESS", "LOSSLESS"} and not lossless:
             return None
@@ -226,11 +275,13 @@ class FlacBridge:
             provider=base,
             bit_depth=int(stream["bitDepth"]) if stream.get("bitDepth") else None,
             sample_rate=int(stream["sampleRate"]) if stream.get("sampleRate") else None,
+            is_dash=is_dash,
         )
         self._urls[key] = (expires, result)
         logger.info(
-            "flac_bridge: %s for %s via %s (%s)",
+            "flac_bridge: %s (dash=%s) for %s via %s (%s)",
             content_type,
+            is_dash,
             track_id,
             base,
             quality,
@@ -252,25 +303,28 @@ class FlacBridge:
         key = f"{_norm(artist)}|{_norm(title)}|{round(duration_s or 0)}|{effective}"
         now = time.monotonic()
         cached = self._resolved.get(key)
-        if cached and cached[0] > now:
-            stream = await self._stream_url(cached[1], cached[2], effective)
-            if stream:
-                return stream
         for base in self._addons:
             manifest = await self._manifest(base)
             if manifest is None:
                 continue
-            track_id: str | None = None
+            addon_id = manifest.get("id")
+            if cached and cached[0] > now:
+                cached_base, track_id = cached[1], cached[2]
+                if cached_base == base:
+                    stream = await self._stream_url(base, track_id, effective, addon_id=addon_id)
+                    if stream:
+                        return stream
+            track_id = None
             resources: set[str] = manifest.get("resources") or set()
             if isrc and "isrc" in resources:
-                data = await self._json(base + "/resolve-isrc", {"isrc": isrc})
+                data = await self._json(base + "/resolve-isrc", {"isrc": isrc}, addon_id=addon_id)
                 if data and data.get("trackId"):
                     track_id = str(data["trackId"])
             if not track_id:
                 track_id = await self._track_id(base, manifest, artist, title, duration_s)
             if not track_id:
                 continue
-            stream = await self._stream_url(base, track_id, effective)
+            stream = await self._stream_url(base, track_id, effective, addon_id=addon_id)
             if stream:
                 self._resolved[key] = (now + _RESOLVE_TTL, base, track_id)
                 return stream
