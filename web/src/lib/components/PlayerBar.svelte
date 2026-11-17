@@ -103,9 +103,9 @@
 						<span class="lcd-sub ellipsis">
 							<ArtistLinks item={song} />
 							{#if song.album}
-								&nbsp;—&nbsp;<a href={href.album(song.album)}
-									>{song.album}</a
-								>
+								&nbsp;—&nbsp;{#if song.albumId}<a href={href.album(song.albumId)}
+										>{song.album}</a
+									>{:else}{song.album}{/if}
 							{/if}
 						</span>
 						<button
@@ -122,6 +122,7 @@
 					<Slider
 						value={progressTime}
 						max={player.duration}
+						step={5}
 						label="Seek"
 						onchange={(v) => player.seek(v)}
 						oninput={(v) => (scrub = v)}

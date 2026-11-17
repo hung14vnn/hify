@@ -425,7 +425,7 @@
 	* art box. Opening a panel shrinks the hero into the thumbnail; closing grows
 	* it back. Single-element flight prevents any ghosting/double-image artifacts.
 	*/
-	function heroFlip(opening: boolean, wrapBefore?: DOMRect, layersBefore?: DOMRect) {
+	function heroFlip(opening: boolean, layersBefore?: DOMRect) {
 		heroAnims.forEach((a) => a.cancel());
 		heroAnims = [];
 		if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
@@ -460,21 +460,18 @@
 								offset: 0,
 								transformOrigin: "0 0",
 								transform: full,
-								borderRadius: "0px",
 								opacity: 1,
 							},
 							{
 								offset: 0.92,
 								transformOrigin: "0 0",
 								transform: small,
-								borderRadius: "6px",
 								opacity: 1,
 							},
 							{
 								offset: 1,
 								transformOrigin: "0 0",
 								transform: small,
-								borderRadius: "6px",
 								opacity: 0,
 							},
 						]
@@ -483,14 +480,12 @@
 								offset: 0,
 								transformOrigin: "0 0",
 								transform: small,
-								borderRadius: "6px",
 								opacity: 1,
 							},
 							{
 								offset: 1,
 								transformOrigin: "0 0",
 								transform: full,
-								borderRadius: "0px",
 								opacity: 1,
 							},
 						],
@@ -526,9 +521,6 @@
 		const first = new Map(
 			els().map((el) => [el.dataset.flip!, el.getBoundingClientRect()]),
 		);
-		const wrapBefore = mainEl
-			.querySelector<HTMLElement>(".art-wrap")
-			?.getBoundingClientRect();
 		const layersBefore = mainEl
 			.querySelector<HTMLElement>(".art-layers")
 			?.getBoundingClientRect();
@@ -585,16 +577,22 @@
 			);
 		}
 
-		if (heroToggle) heroFlip(!wasOpen, wrapBefore, layersBefore);
+		if (heroToggle) heroFlip(!wasOpen, layersBefore);
 	}
 
+	let panelReadyTimer: ReturnType<typeof setTimeout> | undefined;
 	function toggleMobilePanel(panel: Panel) {
 		if (!isMobile) return ui.togglePanel(panel);
-		// Opening: mount the panel's content after the animation has started.
-		if (!ui.panel) panelReady = false;
-		flip(() => ui.togglePanel(panel)).finally(() =>
-			requestAnimationFrame(() => (panelReady = true)),
-		);
+		clearTimeout(panelReadyTimer);
+		// Opening: mount the panel's content only once the FLIP has (nearly) landed.
+		// Mounting Queue/Lyrics (am-lyrics especially) mid-flight blocks the main
+		// thread and rasterises new layers, which is what made Android stutter.
+		const opening = !ui.panel;
+		if (opening) panelReady = false;
+		flip(() => ui.togglePanel(panel)).finally(() => {
+			if (!opening) return void (panelReady = true);
+			panelReadyTimer = setTimeout(() => (panelReady = true), FLIP_MS_OPEN - 60);
+		});
 	}
 
 	// Swipe-down-to-dismiss from anywhere in the Now Playing screen.
@@ -928,11 +926,16 @@
 	}
 
 	function onKey(e: KeyboardEvent) {
-		if (e.key === "Escape") close();
+		if (e.key !== "Escape") return;
+		// An overlay on top (menu, pickers, removal prompt) takes this Escape (Overlays).
+		// Listened to in the capture phase so this sees them before Overlays closes them.
+		if (ui.menu || ui.playlistPicker || ui.sleepTimerPicker || ui.removal || player.karaokeWaiting) return;
+		if (showAudioSpecs) showAudioSpecs = false;
+		else close();
 	}
 </script>
 
-<svelte:window onkeydown={onKey} />
+<svelte:window onkeydowncapture={onKey} />
 
 <div
 	transition:morph
@@ -1151,7 +1154,9 @@
 					onpointerdown={panel === "lyrics" ? showControls : undefined}
 				>
 					{#if panelReady}
-						{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+						<div class="panel-fill" in:fadeOnly={{ duration: 220 }}>
+							{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+						</div>
 					{/if}
 				</div>
 			{/key}
@@ -1319,6 +1324,7 @@
 						<Slider
 							value={progressTime}
 							max={trackDuration}
+							step={5}
 							label="Seek"
 							onchange={(v) => player.seek(v)}
 							oninput={(v) => (scrub = v)}
@@ -2278,6 +2284,10 @@
 		width: 100%;
 		height: 100%;
 	}
+	.panel-fill {
+		position: absolute;
+		inset: 0;
+	}
 	.nothing {
 		flex: 1;
 		display: grid;
@@ -2345,7 +2355,6 @@
 				transparent calc(100% - 178px),
 				transparent 100%
 			);
-			transition: mask-image 0.45s ease, -webkit-mask-image 0.45s ease;
 		}
 		.controls.panel-open {
 			flex: 0 0 auto;

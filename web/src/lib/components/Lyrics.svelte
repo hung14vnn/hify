@@ -75,6 +75,7 @@
 					isPlaying={player.playing && !player.buffering}
 					isrc={song.isrc?.[0] ?? ""}
 					onseek={(s) => player.seek(s)}
+					onunavailable={() => (wordSynced = false)}
 					maxFps={15}
 				/>
 			</div>

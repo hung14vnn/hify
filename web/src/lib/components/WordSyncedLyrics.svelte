@@ -4,7 +4,9 @@
 	type AmLyricsElement = HTMLElement & {
 		currentTime: number;
 		duration: number;
-		fetchLyrics?: () => void;
+		fetchLyrics?: () => Promise<void> | void;
+		/** Lit state, private in its typings but readable at runtime. */
+		lyrics?: unknown[];
 	};
 
 	interface Props {
@@ -17,6 +19,8 @@
 		isrc?: string;
 		maxFps?: number;
 		onseek?: (seconds: number) => void;
+		/** am-lyrics found nothing (or couldn't load): the caller falls back. */
+		onunavailable?: () => void;
 	}
 
 	const AM_LYRICS_CDN_URL =
@@ -74,6 +78,7 @@
 		isrc = "",
 		maxFps = 60,
 		onseek = () => {},
+		onunavailable = () => {},
 	}: Props = $props();
 
 	/**
@@ -90,8 +95,10 @@
 	const durationMs = $derived(
 		durationSeconds > 0 ? Math.round(durationSeconds * 1000) : 0,
 	);
+	// Rounded: the player swaps the metadata's whole seconds for the media's exact
+	// float once it loads, which used to refetch (and flash) the lyrics every track.
 	const songKey = $derived(
-		[title, artist, album, isrc, durationSeconds].join("|"),
+		[title, artist, album, isrc, Math.round(durationSeconds)].join("|"),
 	);
 
 	// Clock: không cần reactive, chỉ dùng nội bộ
@@ -226,7 +233,10 @@
 			.then(() => {
 				if (!disposed) ready = true;
 			})
-			.catch((error) => console.error(error));
+			.catch((error) => {
+				console.error(error);
+				if (!disposed) onunavailable();
+			});
 
 		// Hiện lại → publish ngay thời gian hiện tại và chạy lại clock nếu đang phát.
 		const onVisibilityChange = () => {
@@ -283,8 +293,15 @@
 		if (!ready || !target) return;
 
 		untrack(() => {
+			const key = songKey;
 			applyAttributes(target);
-			target.fetchLyrics?.();
+			Promise.resolve(target.fetchLyrics?.())
+				.then(() => {
+					// Superseded by another song, or found something: nothing to do.
+					if (disposed || key !== songKey) return;
+					if (!target.lyrics?.length) onunavailable();
+				})
+				.catch(() => {});
 		});
 	});
 

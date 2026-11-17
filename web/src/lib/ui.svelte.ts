@@ -1,5 +1,5 @@
 import { SvelteSet } from 'svelte/reactivity';
-import { addToPlaylist, cached, createPlaylist, getPlaylists, getUser, setStarred, type UserInfo } from './api';
+import { addToPlaylist, cached, createPlaylist, getPlaylists, getStarred, getUser, setStarred, type UserInfo } from './api';
 import type { Album, Artist, Playlist, Song } from './types';
 
 export interface MenuItem {
@@ -30,6 +30,13 @@ class UI {
 	playlists = $state<Playlist[]>([]);
 	/** Optimistic love state keyed by id, layered over what the server returned. */
 	loved = $state<Record<string, boolean>>({});
+	/**
+	 * Every starred song/album/artist id (from getStarred2). Only that endpoint sets
+	 * `starred` on items: songs from albums, search, playlists or a restored queue
+	 * come without it, so Now Playing showed an empty star for a liked song.
+	 */
+	starredIds = new SvelteSet<string>();
+	private starredLoaded = false;
 	me = $state<UserInfo | null>(null);
 
 	private toastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -88,7 +95,21 @@ class UI {
 	}
 
 	isLoved(item: { id: string; starred?: string }) {
-		return this.loved[item.id] ?? !!item.starred;
+		return this.loved[item.id] ?? (this.starredIds.has(item.id) || (!this.starredLoaded && !!item.starred));
+	}
+
+	async refreshStarred() {
+		const apply = (s: Awaited<ReturnType<typeof getStarred>>) => {
+			this.starredIds.clear();
+			for (const item of [...s.songs, ...s.albums, ...s.artists]) this.starredIds.add(item.id);
+			this.starredLoaded = true;
+		};
+		try {
+			// Same key as the Songs view, so both share one cached copy.
+			apply(await cached('library:starred', getStarred, { fresh: 0, refresh: apply }));
+		} catch {
+			/* items still carry their own `starred` flag */
+		}
 	}
 
 	async toggleLove(kind: 'song' | 'album' | 'artist', item: Song | Album | Artist) {
@@ -96,6 +117,8 @@ class UI {
 		this.loved[item.id] = next;
 		try {
 			await setStarred(kind, item.id, next);
+			if (next) this.starredIds.add(item.id);
+			else this.starredIds.delete(item.id);
 			this.showToast(next ? 'Added to Favorites' : 'Removed from Favorites');
 		} catch {
 			this.loved[item.id] = !next;

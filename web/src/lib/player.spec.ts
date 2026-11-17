@@ -535,6 +535,30 @@ describe('Player platform fixes', () => {
 		}
 	});
 
+	it('reloads on Play after giving up on a stalled stream, instead of spinning forever', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+		try {
+			const { player, audio } = await freshPlayer();
+			// A dead stream: never reaches canplay, and (unlike a decode error) no audio.error.
+			player.playList([song('a')]);
+			await vi.advanceTimersByTimeAsync(0);
+			// Stall → retry once (2 s later) → stall again → nothing to skip to: give up.
+			await vi.advanceTimersByTimeAsync(15_100 + 2_100 + 15_100);
+			expect(player.error).toBeTruthy();
+			expect(player.buffering).toBe(false);
+			expect(audio.error).toBeNull();
+
+			audio.load.mockClear();
+			player.resume();
+			await vi.advanceTimersByTimeAsync(0);
+			// A fresh request, not play() on the dead one.
+			expect(audio.load).toHaveBeenCalled();
+			expect(player.error).toBeNull();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it('does not treat a slow start as a stall the moment it starts playing', async () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
 		try {

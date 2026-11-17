@@ -255,23 +255,37 @@ class StreamService:
         content_type: str,
         extra_headers: dict[str, str] | None = None,
         time_offset: float | None = None,
+        user_agent: str | None = None,
     ) -> StreamingResponse:
+        seeking = bool(time_offset and time_offset > 0)
         cmd = ["ffmpeg", "-loglevel", "error"]
-        if time_offset and time_offset > 0:
+        if user_agent:
+            cmd.extend(["-user_agent", user_agent])
+        if seeking:
             cmd.extend(["-ss", f"{time_offset:.2f}"])
+        # A stream copy keeps the source's FLAC frame numbers and STREAMINFO, so a
+        # seeked stream claims to start at the offset with the full track length, and
+        # browsers disagree on whether currentTime starts at 0 or at the offset (the
+        # player's clock then jumped). Re-encoding is still lossless (bit-exact), runs
+        # ~100x realtime even at 24/192, and restarts timestamps at 0 with a correct
+        # length. It is also the only option when the source isn't FLAC to begin with.
+        codec = "flac" if seeking or content_type != "audio/flac" else "copy"
         cmd.extend([
             "-i", url,
-            "-c:a", "copy",
+            "-c:a", codec,
             "-f", "flac",
             "pipe:1",
         ])
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-
         async def body() -> AsyncIterator[bytes]:
+            # Spawned here, not before the response: a client that aborts first (fast
+            # scrubbing cancels every previous seek) never starts iterating, and a
+            # process spawned outside would never reach this cleanup. stderr is
+            # discarded: an undrained pipe fills up and blocks ffmpeg mid-stream.
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             try:
                 while True:
                     chunk = await proc.stdout.read(64 * 1024)
@@ -291,8 +305,9 @@ class StreamService:
                         except Exception:
                             pass
 
+        # The output is always a FLAC stream, whatever the source container was.
         headers = {
-            "Content-Type": content_type,
+            "Content-Type": "audio/flac",
             "Content-Encoding": "identity",
             "Accept-Ranges": "none",
         }
@@ -303,10 +318,23 @@ class StreamService:
             body(),
             status_code=200,
             headers=headers,
-            media_type=content_type,
+            media_type="audio/flac",
         )
 
-    async def _proxy_yt(self, video_id: str, range_header: str | None) -> StreamingResponse:
+    async def _proxy_yt(
+        self, video_id: str, range_header: str | None, time_offset: float | None = None
+    ) -> StreamingResponse:
+        if time_offset and time_offset > 0:
+            # The player asked for a server-side seek (it took this for a FLAC stream).
+            # Ignoring the offset would play from 0:00 while its clock shows the offset,
+            # so cut the YouTube audio here too, as the same restart-at-0 FLAC stream.
+            info = await self._ytmusic.stream_info(video_id, fmt=settings.yt_format)
+            return await self._proxy_ffmpeg(
+                info.audio_url,
+                "audio/flac",
+                time_offset=time_offset,
+                user_agent=info.http_headers.get("User-Agent"),
+            )
         last_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -343,7 +371,7 @@ class StreamService:
         if song_id.startswith("ytv-"):
             if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
                 raise SubsonicError(70, "Invalid YouTube video id")
-            return await self._proxy_yt(song_id, range_header)
+            return await self._proxy_yt(song_id, range_header, time_offset)
         is_yt = song_id.startswith("yt-")
         if not is_yt and not song_id.startswith("st-"):
             raise SubsonicError(70, "Invalid id type")
@@ -354,7 +382,7 @@ class StreamService:
         if meta is None:
             if is_yt:
                 # No metadata means the FLAC bridge cannot be searched; play YouTube.
-                return await self._proxy_yt(song_id[3:], range_header)
+                return await self._proxy_yt(song_id[3:], range_header, time_offset)
             raise SubsonicError(70, "Song not found")
         artist = self._artist(meta)
         title = str(meta.get("title") or "")
@@ -390,8 +418,8 @@ class StreamService:
             except (httpx.HTTPError, ValueError, SubsonicError, OSError) as exc:
                 logger.warning("flac_bridge: proxy failed, falling back to YT: %s", exc)
         if is_yt:
-            return await self._proxy_yt(song_id[3:], range_header)
+            return await self._proxy_yt(song_id[3:], range_header, time_offset)
         info = await self._ytmusic.search(
             artist, title, fmt=settings.yt_format, expected_duration_s=duration
         )
-        return await self._proxy_yt(info.video_id, range_header)
+        return await self._proxy_yt(info.video_id, range_header, time_offset)

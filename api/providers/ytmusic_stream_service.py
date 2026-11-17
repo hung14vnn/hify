@@ -759,6 +759,10 @@ class YTMusicStreamService:
             logger.warning("YTMusic radio playlists failed: %s", e)
             return []
 
+    async def stream_info(self, video_id: str, fmt: str = "opus") -> StreamInfo:
+        """Resolved audio URL (+ the headers it needs) for *video_id*, from the cache when warm."""
+        return await self._resolve(video_id, None, None, fmt)
+
     async def search_videos(self, query: str, limit: int = 10) -> list[dict]:
         return await self._run_blocking(_YtDlp.search_videos, query, limit, what="search")
 

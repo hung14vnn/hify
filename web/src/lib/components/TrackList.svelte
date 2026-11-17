@@ -252,6 +252,9 @@
 		padding: 18px 10px 6px;
 	}
 	.row {
+		/* Long lists (liked songs, big playlists): skip layout/paint of off-screen rows. */
+		content-visibility: auto;
+		contain-intrinsic-size: auto 52px;
 		display: grid;
 		grid-template-columns: 36px minmax(0, 1.4fr) 20px 52px 32px;
 		align-items: center;

@@ -27,6 +27,36 @@ import type { Song } from './types';
 export type { Repeat };
 
 /** The codec actually being served, learned from the stream's Content-Type. */
+/**
+ * Streams the browser can't byte-seek (lossless remuxes, Spotify bridges): a seek
+ * re-requests the stream with `timeOffset` instead of setting currentTime.
+ */
+function seeksOnServer(song: Song): boolean {
+	return isLossless(song) || song.suffix === 'flac' || song.id.startsWith('st-');
+}
+
+/**
+ * The body as a Blob, or null once it grows past `max` bytes. Content-Length alone
+ * can't cap it: piped streams (ffmpeg remuxes of hi-res FLAC, 100-250 MB) send none.
+ */
+async function readCapped(res: Response, max: number): Promise<Blob | null> {
+	if (!res.body) return res.blob();
+	const reader = res.body.getReader();
+	const parts: Uint8Array[] = [];
+	let size = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		size += value.byteLength;
+		if (size > max) {
+			void reader.cancel();
+			return null;
+		}
+		parts.push(value);
+	}
+	return new Blob(parts as BlobPart[], { type: res.headers.get('content-type') ?? '' });
+}
+
 function suffixFromContentType(value: string | null): string {
 	const type = (value ?? '').toLowerCase();
 	if (type.includes('flac')) return 'flac';
@@ -309,6 +339,12 @@ class Player {
 	private streamBust = 0;
 	/** Time offset in seconds when streaming an unseekable/transcoded stream from a seek position. */
 	private streamOffset = 0;
+	/** A server-side seek (`timeOffset`) was just requested: the first real progress
+	 *  tells whether the stream restarts its clock at 0 or keeps the original timestamp. */
+	private streamOffsetUnverified = false;
+	/** load() is awaiting the offline lookup: the outgoing element is still the active
+	 *  one, but its time/end/error belong to the previous track and must be ignored. */
+	private switching = false;
 	/** Offline/prefetched copy now playing, revoked on the next change. */
 	private playingOffline: OfflineCopy | null = null;
 	/**
@@ -496,7 +532,7 @@ class Player {
 		});
 		a.addEventListener('loadedmetadata', () => {
 			if (this.audio !== a) return;
-			if (this.pendingSeek && !this.streamOffset) {
+			if (this.pendingSeek) {
 				a.currentTime = this.pendingSeek;
 				this.pendingSeek = 0;
 			}
@@ -506,7 +542,7 @@ class Player {
 			if (this.audio === a) this.applyDuration();
 		});
 		a.addEventListener('timeupdate', () => {
-			if (this.audio === a) this.onTime();
+			if (this.audio === a && !this.switching) this.onTime();
 		});
 		a.addEventListener('seeked', () => {
 			if (this.audio === a) {
@@ -515,10 +551,10 @@ class Player {
 			}
 		});
 		a.addEventListener('ended', () => {
-			if (this.audio === a) this.onEnded();
+			if (this.audio === a && !this.switching) this.onEnded();
 		});
 		a.addEventListener('error', () => {
-			if (this.audio === a) this.onError();
+			if (this.audio === a && !this.switching) this.onError();
 		});
 		for (const type of LOGGED_EVENTS) {
 			a.addEventListener(type, () => {
@@ -640,7 +676,11 @@ class Player {
 		if (!this.current) return;
 		// A source that errored can't just be played again; reload it. This is also
 		// how the user restarts playback after the player gave up on a dead server.
-		if (!this.audio.src || this.audio.error) {
+		// A stall leaves no `audio.error`, so also reload whenever this load's failure
+		// was already handled: play() on the dead request would spin forever, because
+		// onError ignores a second failure of the same load. (Giving up may also have
+		// moved `index` back to the first failed track, away from the loaded src.)
+		if (!this.audio.src || this.audio.error || this.errorHandledToken === this.loadToken) {
 			this.errorRetriedFor = null;
 			this.errorSkips = 0;
 			this.load(this.index, true, this.time);
@@ -658,7 +698,8 @@ class Player {
 		this.playRequested = false;
 		this.resumeWhenVisible = false;
 		this.buffering = false;
-		this.interruptions.userPause();		this.cancelPreroll();
+		this.interruptions.userPause();
+		this.cancelPreroll();
 		if (this.retiring) this.finishRetire(this.retiring.el);
 		this.audio.pause();
 	}
@@ -680,9 +721,17 @@ class Player {
 
 	seek(seconds: number) {
 		// Back from the last seconds: the next song isn't due yet (onTime starts it again).
+		// Seeking must not change play/pause: `next()` at the end of the queue pauses
+		// and then seeks to 0, which used to restart server-seek tracks forever.
+		const resume = this.playRequested;
 		this.cancelPreroll();
 		this.setTime(seconds);
 		const a = this.audio;
+		if (!a.src) {
+			// Nothing loaded yet (restored queue): resume() loads from this.time.
+			this.updatePosition();
+			return;
+		}
 		const isOfflineOrBlob = this.playingOffline || (a.src && a.src.startsWith('blob:'));
 
 		if (isOfflineOrBlob) {
@@ -700,20 +749,15 @@ class Player {
 		}
 
 		// A lossless or piped stream cannot be byte-seeked by the browser; seek via server timeOffset.
-		const isLosslessStream =
-			this.streamOffset > 0 ||
-			(this.current && (isLossless(this.current) || this.current.suffix === 'flac' || this.current.id.startsWith('st-'))) ||
-			!Number.isFinite(a.duration) ||
-			a.duration <= 0;
+		// A piped stream with no known length can't be byte-seeked either.
+		const serverSeek =
+			this.streamOffset > 0 || (this.current && seeksOnServer(this.current)) || !Number.isFinite(a.duration) || a.duration <= 0;
 
-		if (isLosslessStream && this.current) {
-			this.streamOffset = seconds;
-			this.pendingSeek = 0;
-			const src = streamUrl(this.current.id, ++this.streamBust, seconds);
+		if (serverSeek && this.current) {
 			logPlayback('stream-seek', `id=${this.current.id} at=${seconds.toFixed(1)}`);
-			a.src = src;
-			a.load();
-			this.play();
+			this.audio.autoplay = resume;
+			this.restartStreamAt(seconds);
+			if (resume) this.play();
 		} else {
 			if (a.src) {
 				try {
@@ -726,6 +770,20 @@ class Player {
 			}
 		}
 		this.updatePosition();
+	}
+
+	/** Re-request the current track's stream from `seconds` (server-side seek). */
+	private restartStreamAt(seconds: number) {
+		const song = this.current;
+		if (!song) return;
+		this.streamOffset = seconds;
+		this.streamOffsetUnverified = seconds > 0;
+		this.pendingSeek = 0;
+		// A fresh request: its own failure must reach onError even if an earlier
+		// one of this load was already handled.
+		this.errorHandledToken = -1;
+		this.audio.src = streamUrl(song.id, ++this.streamBust, seconds);
+		this.audio.load();
 	}
 
 	setVolume(v: number) {
@@ -934,6 +992,7 @@ class Player {
 
 	cycleRepeat() {
 		this.repeat = cycleRepeat(this.repeat);
+		if (this.repeat === 'one') this.cancelPreroll();
 		this.persist();
 	}
 
@@ -1018,6 +1077,7 @@ class Player {
 		} else {
 			// IndexedDB is local and safe to read in the background. If there is no
 			// explicitly downloaded copy, native <audio> remains the fallback.
+			this.switching = true;
 			const copy = await lookupOffline(song.id);
 			// The user moved on to another track while we were looking.
 			if (this.destroyed || token !== this.loadToken) {
@@ -1026,10 +1086,14 @@ class Player {
 			}
 			if (copy) offline = { id: song.id, copy };
 		}
+		this.switching = false;
 		const outgoing = this.playingOffline;
 		this.playingOffline = offline;
-		const isLosslessStream = !offline && (isLossless(song) || song.suffix === 'flac' || song.id.startsWith('st-'));
-		this.streamOffset = startAt > 0 && isLosslessStream ? startAt : 0;
+		const serverSeek = !offline && seeksOnServer(song);
+		this.streamOffset = startAt > 0 && serverSeek ? startAt : 0;
+		this.streamOffsetUnverified = this.streamOffset > 0;
+		// The server already starts the stream at startAt: don't seek again on metadata.
+		if (this.streamOffset) this.pendingSeek = 0;
 		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0, this.streamOffset);
 		const handoff = autoplay && startAt === 0 && this.standbyHolds(src);
 
@@ -1049,7 +1113,7 @@ class Player {
 			this.applyVolume(this.audio);
 			this.audio.src = src;
 			this.audio.load();
-			if (startAt > 0 && !isLosslessStream) this.audio.currentTime = startAt;
+			if (startAt > 0 && !serverSeek) this.audio.currentTime = startAt;
 		}
 		this.output?.trackChanged(isLossless(song));
 		this.applyReplayGain();
@@ -1245,6 +1309,9 @@ class Player {
 		this.standbyFor = null;
 		this.bindActiveAudio(next);
 		this.applyVolume(next);
+		// Its loadedmetadata fired while it was the standby (ignored then) and won't
+		// fire again: take the real length now, or the metadata guess sticks.
+		if (next.readyState >= 1) this.applyDuration();
 		const preroll = this.preroll;
 		if (preroll) {
 			this.preroll = null;
@@ -1442,7 +1509,12 @@ class Player {
 				logPlayback('blob-skipped', `id=${next.id} too large (${length} bytes), will stream`);
 				return;
 			}
-			const blob = await res.blob();
+			const blob = await readCapped(res, MAX_BLOB_BYTES);
+			if (!blob) {
+				this.blobFailure = { id: next.id, count: attempt, at: performance.now(), final: true };
+				logPlayback('blob-skipped', `id=${next.id} too large (no length, > ${MAX_BLOB_BYTES} bytes), will stream`);
+				return;
+			}
 			if (this.destroyed || this.upcoming()?.id !== next.id) return;
 			if (blob.size < MIN_BLOB_BYTES) throw new Error(`too small (${blob.size} bytes)`);
 			// An offline copy could have landed while we downloaded.
@@ -1552,7 +1624,8 @@ class Player {
 		this.playRequested = true;
 		this.resumeWhenVisible = false;
 		// A source that failed while the network was cut can't just be played again.
-		if (this.audio.error || !this.audio.src || stalledInBackground) {
+		// Nor can one this load already gave up on (see resume()).
+		if (this.audio.error || !this.audio.src || stalledInBackground || this.errorHandledToken === this.loadToken) {
 			this.errorRetriedFor = null;
 			this.errorSkips = 0;
 			this.load(this.index, true, this.time);
@@ -1601,9 +1674,20 @@ class Player {
 	private onTime() {
 		const a = this.audio;
 		if (a.seeking) return;
-		if (this.streamOffset > 0 && a.currentTime >= this.streamOffset - 3) {
-			// The stream already preserved the timestamp (e.g. ffmpeg DASH copy)
-			this.streamOffset = 0;
+		if (this.streamOffsetUnverified) {
+			// Nothing decoded yet from the new request: hold the clock at the seek target
+			// (old element times or a 0 before the first frame must not move it).
+			if (a.currentTime <= 0.05) {
+				this.time = this.streamOffset;
+				if (!document.hidden) this.currentTime = this.time;
+				return;
+			}
+			// Decide once, on the first progress. The server re-encodes seeked streams so
+			// they restart at ~0, but an older server (stream copy) keeps the original
+			// timestamp and reports ~offset. Checking on every timeupdate instead would
+			// mistake a restarted stream for a preserved one after (offset - 3) s of play.
+			this.streamOffsetUnverified = false;
+			if (a.currentTime >= this.streamOffset / 2) this.streamOffset = 0;
 		}
 		this.time = this.streamOffset + a.currentTime;
 		if (!document.hidden) this.currentTime = this.time;
@@ -1741,6 +1825,9 @@ class Player {
 		this.buffering = true;
 		this.audio.pause();
 		logPlayback('stall-timeout', `t=${this.time.toFixed(1)} rs=${this.audio.readyState}`);
+		// Already handled for this load (onError would ignore it): never leave the
+		// spinner up with nothing re-armed; stop and show the error instead.
+		if (this.errorHandledToken === this.loadToken) return this.giveUp();
 		this.onError();
 	};
 
@@ -1783,9 +1870,16 @@ class Player {
 			this.afterErrorDelay(() => this.next());
 			return;
 		}
-		// Several different tracks failed in a row: that is the connection or the
-		// session, not the tracks. Go back to the first failed track instead of
-		// burning through the queue, and resume it when the app is visible again.
+		this.giveUp();
+	}
+
+	/**
+	 * Stop retrying. Several different tracks failed in a row: that is the connection
+	 * or the session, not the tracks. Go back to the first failed track instead of
+	 * burning through the queue, and resume it when the app is visible again.
+	 */
+	private giveUp() {
+		if (!this.error && this.current) this.error = `Couldn't play “${this.current.title}”`;
 		if (this.errorOriginIndex >= 0 && this.errorOriginIndex !== this.index && this.queue[this.errorOriginIndex]) {
 			this.index = this.errorOriginIndex;
 			this.setTime(0);
@@ -1837,13 +1931,15 @@ class Player {
 
 	private onEnded() {
 		if (this.repeat === 'one') {
+			// A crossfade already under way would keep the next song playing unseen.
+			this.cancelPreroll();
 			this.scrobbled = false;
-			this.streamOffset = 0;
-			if (this.current && (isLossless(this.current) || this.current.suffix === 'flac' || this.current.id.startsWith('st-'))) {
-				const src = streamUrl(this.current.id, ++this.streamBust, 0);
-				this.audio.src = src;
-				this.audio.load();
+			// An offline copy rewinds in place; only a live server-seek stream is re-requested.
+			if (!this.playingOffline && this.current && seeksOnServer(this.current)) {
+				this.restartStreamAt(0);
 			} else {
+				this.streamOffset = 0;
+				this.streamOffsetUnverified = false;
 				this.audio.currentTime = 0;
 			}
 			this.play();

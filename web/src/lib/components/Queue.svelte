@@ -268,7 +268,7 @@
 					in:queueItem={{
 						direction: -1,
 						duration: animateQueueChanges ? 220 : 0,
-						delay: animateQueueChanges ? j * 45 : 0,
+						delay: animateQueueChanges ? Math.min(j, 8) * 45 : 0,
 					}}
 					out:queueItem={{
 						direction: 1,
@@ -276,7 +276,7 @@
 						delay: clearingQueue
 							? 0
 							: animateQueueChanges
-								? j * 45
+								? Math.min(j, 8) * 45
 								: 0,
 					}}
 					animate:flip={{ duration: clearingQueue ? 0 : 500 }}
@@ -418,18 +418,21 @@
 		padding-right: 4px;
 		flex-shrink: 0;
 	}
+	/* scaleY, not height: animating height re-laid out the queue every frame. */
 	.now-playing-bars .bar {
 		width: 3px;
+		height: 16px;
 		border-radius: 2px;
 		background: #fff;
+		transform-origin: bottom;
 		animation: barBounce 1s ease-in-out infinite alternate;
 	}
-	.now-playing-bars .bar-1 { height: 14px; animation-delay: 0s; }
-	.now-playing-bars .bar-2 { height: 8px; animation-delay: 0.2s; }
-	.now-playing-bars .bar-3 { height: 12px; animation-delay: 0.4s; }
+	.now-playing-bars .bar-1 { transform: scaleY(0.875); animation-delay: 0s; }
+	.now-playing-bars .bar-2 { transform: scaleY(0.5); animation-delay: 0.2s; }
+	.now-playing-bars .bar-3 { transform: scaleY(0.75); animation-delay: 0.4s; }
 	@keyframes barBounce {
-		0% { height: 4px; }
-		100% { height: 16px; }
+		0% { transform: scaleY(0.25); }
+		100% { transform: scaleY(1); }
 	}
 	.now-playing-bars.paused .bar {
 		animation-play-state: paused;

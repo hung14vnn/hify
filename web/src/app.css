@@ -498,6 +498,14 @@ a.tile:active {
   animation-delay: 210ms;
 }
 
+/* Only the first screenful reveals: a 500-track list used to start 500 animations
+   (each its own compositor layer) at once, which stalled the page slide on Android. */
+.grid> :nth-child(n + 17),
+.shelf .row> :nth-child(n + 17),
+.tracks>.row:nth-child(n + 17) {
+  animation: none;
+}
+
 /* Spinners only appear if loading takes a noticeable moment (no flash). */
 .spinner {
   animation:

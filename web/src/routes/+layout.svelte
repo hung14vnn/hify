@@ -65,6 +65,7 @@
 		if (auth.signedIn) {
 			ui.refreshPlaylists();
 			ui.loadMe();
+			ui.refreshStarred();
 		}
 	});
 
