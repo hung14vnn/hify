@@ -48,7 +48,7 @@
 				<p>Tap the heart on songs you love and they appear here.</p>
 			</div>
 		{:else}
-			<div class="pad"><TrackList songs={s.songs} /></div>
+			<div class="pad"><TrackList songs={s.songs} showLove={false} /></div>
 		{/if}
 	{:catch error}
 		<ErrorState {error} retry={() => (data = load())} />

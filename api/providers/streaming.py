@@ -30,7 +30,7 @@ _MAX_REDIRECTS = 3
 
 
 def _content_disposition(artist: str, title: str, content_type: str) -> str:
-    ext = "opus" if ("webm" in content_type or "ogg" in content_type) else ("m4a" if "mp4" in content_type else "mp3")
+    ext = "flac" if "flac" in content_type else ("opus" if ("webm" in content_type or "ogg" in content_type) else ("m4a" if "mp4" in content_type else "mp3"))
     name = f"{artist} - {title}".strip(" -") or "track"
     safe_ascii = re.sub(r'[^\w\s.-]', '', name).strip() or "track"
     filename_ascii = f"{safe_ascii}.{ext}"
@@ -437,8 +437,11 @@ class StreamService:
         self,
         song_id: str,
         range_header: str | None = None,
+        lossless: bool = False,
+        user_id: str | None = None,
     ) -> StreamingResponse:
-        """Download stream: directly resolves through yt-dlp (YouTube Music) without FLAC remuxing."""
+        """Download stream: if lossless=True, resolves through FLAC bridge first (TIDAL Hi-Res),
+        falling back to yt-dlp. If lossless=False, downloads directly through yt-dlp."""
         if song_id.startswith("kr-"):
             raise SubsonicError(70, "Karaoke is not available")
         if song_id.startswith("ytv-"):
@@ -467,7 +470,41 @@ class StreamService:
         title = str(meta.get("title") or "")
         duration = meta.get("duration")
 
-        # For download, always choose stream from yt-dlp (YouTube Music)
+        if lossless:
+            quality = (
+                await db.get_quality(user_id) if user_id else settings.eclipse_quality
+            )
+            if is_yt:
+                flac_artist = _clean_artist(artist)
+                flac_title = _clean_youtube_title(title, artist)
+                flac_duration = None
+            else:
+                flac_artist, flac_title, flac_duration = artist, title, duration
+            flac = await self._flac.resolve(
+                artist=flac_artist,
+                title=flac_title,
+                duration_s=flac_duration,
+                quality=quality,
+            )
+            if flac:
+                try:
+                    disposition = _content_disposition(artist, title, flac.content_type)
+                    quality_headers = {"Content-Disposition": disposition}
+                    if flac.bit_depth:
+                        quality_headers["X-Audio-Bit-Depth"] = str(flac.bit_depth)
+                    if flac.sample_rate:
+                        quality_headers["X-Audio-Sample-Rate"] = str(flac.sample_rate)
+                    if flac.is_dash:
+                        return await self._proxy_ffmpeg(
+                            flac.url, flac.content_type, quality_headers
+                        )
+                    return await self._proxy_direct(
+                        flac.url, range_header, flac.content_type, quality_headers
+                    )
+                except (httpx.HTTPError, ValueError, SubsonicError, OSError) as exc:
+                    logger.warning("flac_bridge: download proxy failed, falling back to YT: %s", exc)
+
+        # Fallback or standard download: yt-dlp (YouTube Music)
         if is_yt:
             video_id = song_id[3:]
         else:

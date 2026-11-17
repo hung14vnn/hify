@@ -29,6 +29,7 @@
 		variant = 'list',
 		albumArtist,
 		showAlbum = true,
+		showLove = true,
 		onplay,
 		extraMenu,
 		downloadedIds = new Set<string>(),
@@ -42,6 +43,7 @@
 		variant?: 'album' | 'list';
 		albumArtist?: string;
 		showAlbum?: boolean;
+		showLove?: boolean;
 		onplay?: (index: number) => void;
 		extraMenu?: (song: Song, index: number) => MenuItem[];
 		downloadedIds?: Set<string>;
@@ -197,10 +199,10 @@
 					<span class="album-col ellipsis">{song.album ?? ''}</span>
 				{/if}
 			{/if}
-			<span class="love" class:on={loved}>
+			<span class="love" class:on={showLove && loved}>
 				{#if downloadedIds.has(song.id) && !selectionMode}
 					<span class="downloaded" aria-label="Downloaded"><Icon name="downloadFill" size={20} /></span>
-				{:else if loved}
+				{:else if showLove && loved}
 					<span class="icon-swap" in:pop={{ from: 0.2, duration: 300 }}>
 						<Icon name="starFill" size={14} />
 					</span>

@@ -387,9 +387,11 @@ export function streamUrl(id: string, bust?: number, timeOffset?: number) {
 	return buildUrl(session, 'stream', params);
 }
 
-export function downloadUrl(id: string) {
+export function downloadUrl(id: string, lossless = false) {
 	if (!session) return '';
-	return buildUrl(session, 'download', { id });
+	const params: Record<string, string | number | boolean> = { id };
+	if (lossless) params.lossless = 1;
+	return buildUrl(session, 'download', params);
 }
 
 /**

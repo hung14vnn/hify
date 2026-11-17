@@ -189,9 +189,12 @@ async def download(request: Request, user=Depends(current_user)):
     if not song_id:
         raise SubsonicError(70, "Song not found")
     range_header = request.headers.get("range") or request.headers.get("Range")
+    lossless = str(request.query_params.get("lossless") or "").lower() in {"1", "true", "yes"}
     return await services["stream"].download(
         song_id,
         range_header,
+        lossless=lossless,
+        user_id=user["user_id"],
     )
 
 

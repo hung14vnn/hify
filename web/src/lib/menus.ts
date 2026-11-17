@@ -73,14 +73,14 @@ export async function songMenu(song: Song, extra: MenuItem[] = []): Promise<Menu
 			label: 'Save Audio File',
 			icon: 'download',
 			action: () => {
-				const url = downloadUrl(song.id);
+				const url = downloadUrl(song.id, true);
 				if (!url) return;
 				const a = document.createElement('a');
 				a.href = url;
 				document.body.appendChild(a);
 				a.click();
 				a.remove();
-				ui.showToast('Downloading file…');
+				ui.showToast('Downloading lossless file…');
 			}
 		},
 		{
