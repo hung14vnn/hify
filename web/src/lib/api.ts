@@ -379,18 +379,30 @@ export function coverUrl(id: string | undefined, size = 300) {
 	return buildUrl(session, 'getCoverArt', { id, size: snapped });
 }
 
-export function streamUrl(id: string, bust?: number, timeOffset?: number) {
+function isIOS(): boolean {
+	if (typeof navigator === 'undefined') return false;
+	return (
+		/iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+		(navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+	);
+}
+
+export function streamUrl(id: string, bust?: number, timeOffset?: number, format?: string) {
 	if (!session) return '';
 	const params: Record<string, string | number> = { id };
 	if (bust) params._ = bust;
 	if (timeOffset && timeOffset > 0) params.timeOffset = Math.round(timeOffset * 100) / 100;
+	const fmt = format ?? (isIOS() ? 'm4a' : undefined);
+	if (fmt) params.format = fmt;
 	return buildUrl(session, 'stream', params);
 }
 
-export function downloadUrl(id: string, lossless = false) {
+export function downloadUrl(id: string, lossless = false, format?: string) {
 	if (!session) return '';
 	const params: Record<string, string | number | boolean> = { id };
 	if (lossless) params.lossless = 1;
+	const fmt = format ?? (!lossless && isIOS() ? 'm4a' : undefined);
+	if (fmt) params.format = fmt;
 	return buildUrl(session, 'download', params);
 }
 

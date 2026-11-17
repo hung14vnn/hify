@@ -163,6 +163,8 @@ async def stream(request: Request, user=Depends(current_user)):
     if not song_id:
         raise SubsonicError(70, "Song not found")
     range_header = request.headers.get("range") or request.headers.get("Range")
+    user_agent = request.headers.get("user-agent") or request.headers.get("User-Agent")
+    format_param = request.query_params.get("format")
     time_offset = (
         request.query_params.get("timeOffset")
         or request.query_params.get("offset")
@@ -179,6 +181,8 @@ async def stream(request: Request, user=Depends(current_user)):
         range_header,
         user["user_id"],
         time_offset=offset_s,
+        user_agent=user_agent,
+        format=format_param,
     )
 
 
@@ -189,12 +193,16 @@ async def download(request: Request, user=Depends(current_user)):
     if not song_id:
         raise SubsonicError(70, "Song not found")
     range_header = request.headers.get("range") or request.headers.get("Range")
+    user_agent = request.headers.get("user-agent") or request.headers.get("User-Agent")
+    format_param = request.query_params.get("format")
     lossless = str(request.query_params.get("lossless") or "").lower() in {"1", "true", "yes"}
     return await services["stream"].download(
         song_id,
         range_header,
         lossless=lossless,
         user_id=user["user_id"],
+        user_agent=user_agent,
+        format=format_param,
     )
 
 

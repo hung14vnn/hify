@@ -98,6 +98,25 @@ class YouTubeSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(song["artist"], "Uploader")
         self.ytmusic.video_meta.assert_awaited_once_with("zyxwvutsrqp")
 
+    async def test_stream_selects_m4a_for_ios_user_agent(self):
+        service = StreamService(MagicMock(), self.spotify, self.ytmusic, MagicMock())
+        service._proxy_yt = AsyncMock(return_value="audio")
+        service.song_meta = AsyncMock()
+        ios_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15"
+        result = await service.stream(f"ytv-{VIDEO_ID}", "bytes=0-1", "user", user_agent=ios_ua)
+        self.assertEqual(result, "audio")
+        service._proxy_yt.assert_awaited_once_with(f"ytv-{VIDEO_ID}", "bytes=0-1", fmt="m4a")
+
+    async def test_download_selects_m4a_for_ios_user_agent(self):
+        service = StreamService(MagicMock(), self.spotify, self.ytmusic, MagicMock())
+        mock_resp = MagicMock()
+        mock_resp.headers = {"Content-Type": "audio/mp4"}
+        service._proxy_yt = AsyncMock(return_value=mock_resp)
+        ios_ua = "AppleCoreMedia/1.0.0.21E236 (iPad; U; CPU OS 17_4_1 like Mac OS X)"
+        await service.download(f"ytv-{VIDEO_ID}", None, user_agent=ios_ua)
+        service._proxy_yt.assert_awaited_once_with(f"ytv-{VIDEO_ID}", None, fmt="m4a")
+        self.assertIn(".m4a", mock_resp.headers["Content-Disposition"])
+
 
 class YouTubeExtractionTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

@@ -38,6 +38,24 @@ def _content_disposition(artist: str, title: str, content_type: str) -> str:
     return f'attachment; filename="{filename_ascii}"; filename*=UTF-8\'\'{filename_utf8}'
 
 
+def is_ios_user_agent(ua: str | None) -> bool:
+    if not ua:
+        return False
+    low = ua.lower()
+    return any(x in low for x in ("iphone", "ipad", "ipod", "cfnetwork", "applecoremedia"))
+
+
+def _effective_fmt(format_param: str | None, user_agent: str | None) -> str:
+    if format_param:
+        low = format_param.lower().strip()
+        if low in {"m4a", "aac", "mp4"}:
+            return "m4a"
+        if low in {"opus", "webm", "ogg"}:
+            return "opus"
+        return low
+    return "m4a" if is_ios_user_agent(user_agent) else settings.yt_format
+
+
 def _blocked_ip(raw: str) -> bool:
     try:
         ip = ipaddress.ip_address(raw)
@@ -331,13 +349,18 @@ class StreamService:
         )
 
     async def _proxy_yt(
-        self, video_id: str, range_header: str | None, time_offset: float | None = None
+        self,
+        video_id: str,
+        range_header: str | None,
+        time_offset: float | None = None,
+        fmt: str | None = None,
     ) -> StreamingResponse:
+        format_name = fmt or settings.yt_format
         if time_offset and time_offset > 0:
             # The player asked for a server-side seek (it took this for a FLAC stream).
             # Ignoring the offset would play from 0:00 while its clock shows the offset,
             # so cut the YouTube audio here too, as the same restart-at-0 FLAC stream.
-            info = await self._ytmusic.stream_info(video_id, fmt=settings.yt_format)
+            info = await self._ytmusic.stream_info(video_id, fmt=format_name)
             return await self._proxy_ffmpeg(
                 info.audio_url,
                 "audio/flac",
@@ -348,7 +371,7 @@ class StreamService:
         for attempt in range(3):
             try:
                 chunks, headers, status = await self._ytmusic.proxy_stream(
-                    video_id, range_header=range_header, fmt=settings.yt_format
+                    video_id, range_header=range_header, fmt=format_name
                 )
                 break
             except httpx.HTTPStatusError as exc:
@@ -374,13 +397,22 @@ class StreamService:
         range_header: str | None,
         user_id: str | None = None,
         time_offset: float | None = None,
+        user_agent: str | None = None,
+        format: str | None = None,
     ) -> StreamingResponse:
+        effective_fmt = _effective_fmt(format, user_agent)
+        yt_kwargs: dict[str, Any] = {}
+        if time_offset is not None:
+            yt_kwargs["time_offset"] = time_offset
+        if effective_fmt != settings.yt_format:
+            yt_kwargs["fmt"] = effective_fmt
+
         if song_id.startswith("kr-"):
             raise SubsonicError(70, "Karaoke is not available")
         if song_id.startswith("ytv-"):
             if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
                 raise SubsonicError(70, "Invalid YouTube video id")
-            return await self._proxy_yt(song_id, range_header, time_offset)
+            return await self._proxy_yt(song_id, range_header, **yt_kwargs)
         is_yt = song_id.startswith("yt-")
         if not is_yt and not song_id.startswith("st-"):
             raise SubsonicError(70, "Invalid id type")
@@ -391,7 +423,7 @@ class StreamService:
         if meta is None:
             if is_yt:
                 # No metadata means the FLAC bridge cannot be searched; play YouTube.
-                return await self._proxy_yt(song_id[3:], range_header, time_offset)
+                return await self._proxy_yt(song_id[3:], range_header, **yt_kwargs)
             raise SubsonicError(70, "Song not found")
         artist = self._artist(meta)
         title = str(meta.get("title") or "")
@@ -427,11 +459,11 @@ class StreamService:
             except (httpx.HTTPError, ValueError, SubsonicError, OSError) as exc:
                 logger.warning("flac_bridge: proxy failed, falling back to YT: %s", exc)
         if is_yt:
-            return await self._proxy_yt(song_id[3:], range_header, time_offset)
+            return await self._proxy_yt(song_id[3:], range_header, **yt_kwargs)
         info = await self._ytmusic.search(
-            artist, title, fmt=settings.yt_format, expected_duration_s=duration
+            artist, title, fmt=effective_fmt, expected_duration_s=duration
         )
-        return await self._proxy_yt(info.video_id, range_header, time_offset)
+        return await self._proxy_yt(info.video_id, range_header, **yt_kwargs)
 
     async def download(
         self,
@@ -439,16 +471,24 @@ class StreamService:
         range_header: str | None = None,
         lossless: bool = False,
         user_id: str | None = None,
+        user_agent: str | None = None,
+        format: str | None = None,
     ) -> StreamingResponse:
         """Download stream: if lossless=True, resolves through FLAC bridge first (TIDAL Hi-Res),
         falling back to yt-dlp. If lossless=False, downloads directly through yt-dlp."""
+        effective_fmt = _effective_fmt(format, user_agent)
+        yt_kwargs: dict[str, Any] = {}
+        if effective_fmt != settings.yt_format:
+            yt_kwargs["fmt"] = effective_fmt
+
         if song_id.startswith("kr-"):
             raise SubsonicError(70, "Karaoke is not available")
         if song_id.startswith("ytv-"):
             if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
                 raise SubsonicError(70, "Invalid YouTube video id")
-            resp = await self._proxy_yt(song_id[4:], range_header)
-            content_type = resp.headers.get("Content-Type", "audio/webm")
+            resp = await self._proxy_yt(song_id, range_header, **yt_kwargs)
+            default_content_type = "audio/mp4" if effective_fmt == "m4a" else "audio/webm"
+            content_type = resp.headers.get("Content-Type", default_content_type)
             resp.headers["Content-Disposition"] = _content_disposition("YouTube", song_id[4:], content_type)
             return resp
 
@@ -460,8 +500,9 @@ class StreamService:
         if meta is None:
             if is_yt:
                 video_id = song_id[3:]
-                resp = await self._proxy_yt(video_id, range_header)
-                content_type = resp.headers.get("Content-Type", "audio/webm")
+                resp = await self._proxy_yt(video_id, range_header, **yt_kwargs)
+                default_content_type = "audio/mp4" if effective_fmt == "m4a" else "audio/webm"
+                content_type = resp.headers.get("Content-Type", default_content_type)
                 resp.headers["Content-Disposition"] = _content_disposition("YouTube", video_id, content_type)
                 return resp
             raise SubsonicError(70, "Song not found")
@@ -509,11 +550,12 @@ class StreamService:
             video_id = song_id[3:]
         else:
             info = await self._ytmusic.search(
-                artist, title, fmt=settings.yt_format, expected_duration_s=duration
+                artist, title, fmt=effective_fmt, expected_duration_s=duration
             )
             video_id = info.video_id
 
-        resp = await self._proxy_yt(video_id, range_header)
-        content_type = resp.headers.get("Content-Type", "audio/webm")
+        resp = await self._proxy_yt(video_id, range_header, **yt_kwargs)
+        default_content_type = "audio/mp4" if effective_fmt == "m4a" else "audio/webm"
+        content_type = resp.headers.get("Content-Type", default_content_type)
         resp.headers["Content-Disposition"] = _content_disposition(artist, title, content_type)
         return resp
