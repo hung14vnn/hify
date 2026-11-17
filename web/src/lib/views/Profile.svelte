@@ -5,6 +5,7 @@
     getLastfmStatus,
     getServerInfo,
     getSession,
+    invalidateCache,
     setLastfmScrobbling,
     type LastfmStatus,
     type ServerInfo,
@@ -99,7 +100,12 @@
         const status = await getLastfmStatus();
         if (disposed) return;
         lastfm = status;
-        if (lastfm.linked || popup.closed) break;
+        if (lastfm.linked) {
+          // Home's "For You" shelves were cached empty while unlinked.
+          void invalidateCache("|home:lastfm");
+          break;
+        }
+        if (popup.closed) break;
       }
       if (!lastfm?.linked && !popup.closed) {
         ui.showToast("Last.fm connection timed out. Please try again.");

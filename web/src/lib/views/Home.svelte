@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from "svelte";
 	import {
 		allNow,
 		cachedNow,
@@ -22,7 +23,7 @@
 	import SongCard from "../components/SongCard.svelte";
 	import TrackList from "../components/TrackList.svelte";
 	import { getPlayer } from "../player.svelte";
-	import type { Album, Song } from "../types";
+	import type { Album, Artist, Playlist, Song } from "../types";
 	import type { LastfmShelf, Maybe } from "../api";
 
 	const player = getPlayer();
@@ -110,12 +111,142 @@
 	// build takes the server a while, so the last copy paints first and swaps when ready.
 	let forYou = $state<Maybe<LastfmShelf[]>>(
 		optional(
-			cachedNow("home:lastfm", () => getLastfmRecommendations(), {
+			// "home:lastfm:v2": copies cached as "home:lastfm" are the empty answers of the
+			// old server stub, and would stay "fresh" for half an hour.
+			cachedNow("home:lastfm:v2", () => getLastfmRecommendations(), {
 				fresh: 30 * 60_000,
 				refresh: (list) => (forYou = list),
 			}),
 		),
 	);
+
+	// ---- section plan ------------------------------------------------------------
+	// Every source resolves on its own; the page is laid out from whatever has arrived,
+	// so a missing shelf (Last.fm not linked, an empty chart) never leaves two of the
+	// same layout back to back.
+	type Reasoned<T> = T & { reason?: string };
+	type Section = { key: string; title: string; subtitle?: string } & (
+		| { kind: "list"; songs: Song[] }
+		| { kind: "recent"; songs: Song[] }
+		| { kind: "artists"; artists: Reasoned<Artist>[] }
+		| { kind: "albums"; albums: Reasoned<Album>[]; seeAll?: string }
+		| { kind: "playlists"; playlists: Playlist[] }
+	);
+
+	const ready = $state<{
+		recent?: Song[];
+		starred?: Album[];
+		picks?: Song[];
+		trending?: Song[];
+		hits?: Song[];
+		newReleases?: Album[];
+		popularPlaylists?: Playlist[];
+		forYou?: LastfmShelf[];
+	}>({});
+
+	/** Mirror a cached-or-pending source into `ready` (latest assignment wins). */
+	function follow<K extends keyof typeof ready>(key: K, get: () => Maybe<NonNullable<(typeof ready)[K]>>) {
+		// A cached copy is a plain value: take it now, so a revisit paints in its first frame.
+		const initial = get();
+		if (!(initial instanceof Promise)) ready[key] = initial;
+		$effect(() => {
+			const source = get();
+			if (source instanceof Promise) {
+				source.then(
+					(value) => {
+						if (get() === source) ready[key] = value;
+					},
+					() => {},
+				);
+			} else ready[key] = source;
+		});
+	}
+	follow("recent", () => recent);
+	follow("starred", () => starred);
+	follow("picks", () => picks);
+	follow("trending", () => trending);
+	follow("hits", () => hits);
+	follow("newReleases", () => newReleases);
+	follow("popularPlaylists", () => popularPlaylists);
+	follow("forYou", () => forYou);
+
+	const firstData = untrack(() => data);
+	let shelves = $state<Shelves | null>(firstData instanceof Promise ? null : firstData);
+	let shelvesError = $state<unknown>(null);
+	$effect(() => {
+		const source = data;
+		shelvesError = null;
+		if (source instanceof Promise) {
+			source.then(
+				(value) => {
+					if (data === source) shelves = value;
+				},
+				(error) => {
+					if (data === source) shelvesError = error;
+				},
+			);
+		} else shelves = source;
+	});
+
+	/** Track lists vs. card shelves: the two layouts that shouldn't repeat. */
+	const isList = (s: Section) => s.kind === "list";
+
+	/**
+	 * Highest priority first, but always taking the next section of the other layout
+	 * when there is one. With more shelves than lists a repeat is unavoidable; it
+	 * then falls at the end, among the least personal shelves.
+	 */
+	function interleave(sections: Section[]): Section[] {
+		const rest = sections.filter(Boolean);
+		const out: Section[] = [];
+		while (rest.length) {
+			const last = out.at(-1);
+			let i = last ? rest.findIndex((s) => isList(s) !== isList(last)) : 0;
+			if (i < 0) i = 0;
+			out.push(...rest.splice(i, 1));
+		}
+		return out;
+	}
+
+	function forYouSection(kind: LastfmShelf["kind"]): Section | null {
+		const shelf = ready.forYou?.find((s) => s.kind === kind);
+		if (!shelf) return null;
+		const base = { key: shelf.key, title: shelf.title, subtitle: shelf.subtitle };
+		if (shelf.kind === "song") return shelf.song.length ? { ...base, kind: "list", songs: shelf.song } : null;
+		if (shelf.kind === "artist") return shelf.artist.length ? { ...base, kind: "artists", artists: shelf.artist } : null;
+		return shelf.album.length ? { ...base, kind: "albums", albums: shelf.album } : null;
+	}
+
+	function plan(d: Shelves | null): Section[] {
+		const list = (key: string, title: string, songs?: Song[]): Section | null =>
+			songs?.length ? { key, title, kind: "list", songs } : null;
+		const albums = (key: string, title: string, items?: Album[], seeAll?: string): Section | null =>
+			items?.length ? { key, title, kind: "albums", albums: items, seeAll } : null;
+		// The library shelves only make sense on a server with a library of its own.
+		const library = !!d?.newest.length;
+		const candidates: (Section | null)[] = [
+			ready.recent?.length ? { key: "recent", title: "Recently Played", kind: "recent", songs: ready.recent } : null,
+			forYouSection("song"),
+			forYouSection("artist"),
+			list("hits", "Today's Hits", ready.hits),
+			forYouSection("album"),
+			list("trending", "Trending Songs", ready.trending),
+			...(library
+				? [
+						albums("newest", "Recently Added", d!.newest, "#/recent"),
+						list("picks", "Top Picks for You", ready.picks),
+						albums("frequent", "Heavy Rotation", d!.frequent),
+						albums("starred", "Favorite Albums", ready.starred, "#/albums"),
+						albums("random", "Rediscover", d!.random, "#/albums"),
+					]
+				: []),
+			ready.popularPlaylists?.length
+				? { key: "playlists", title: "Popular Playlists", kind: "playlists", playlists: ready.popularPlaylists }
+				: null,
+			albums("new-releases", "New Releases", ready.newReleases),
+		];
+		return interleave(candidates.filter((s): s is Section => !!s));
+	}
 
 	function mobilePages(list: Song[]): Song[][] {
 		const pages: Song[][] = [];
@@ -154,27 +285,42 @@
 	{/if}
 {/snippet}
 
-{#snippet lastfm()}
-	{#await forYou then shelves}
-		{#each shelves as shelf (shelf.key)}
-			{#if shelf.kind === "song"}
-				{@render songs(shelf.title, shelf.song, shelf.subtitle)}
-			{:else if shelf.kind === "artist"}
-				<Shelf title={shelf.title} subtitle={shelf.subtitle} size="artist">
-					{#each shelf.artist as artist (artist.id)}
-						<div class="reasoned">
-							<ArtistCard {artist} />
-							{#if artist.reason}<span class="reason">{artist.reason}</span>{/if}
-						</div>
-					{/each}
-				</Shelf>
-			{:else}
-				<Shelf title={shelf.title} subtitle={shelf.subtitle}>
-					{#each shelf.album as album (album.id)}<AlbumCard {album} />{/each}
-				</Shelf>
-			{/if}
-		{/each}
-	{/await}
+{#snippet section(s: Section)}
+	{#if s.kind === "list"}
+		{@render songs(s.title, s.songs, s.subtitle)}
+	{:else if s.kind === "recent"}
+		<Shelf title={s.title} size="lg">
+			{#each s.songs as song, i (song.id)}
+				<SongCard {song} queue={s.songs} index={i} />
+			{/each}
+		</Shelf>
+	{:else if s.kind === "artists"}
+		<Shelf title={s.title} subtitle={s.subtitle} size="artist">
+			{#each s.artists as artist (artist.id)}
+				<div class="reasoned">
+					<ArtistCard {artist} />
+					{#if artist.reason}<span class="reason">{artist.reason}</span>{/if}
+				</div>
+			{/each}
+		</Shelf>
+	{:else if s.kind === "albums"}
+		<Shelf title={s.title} subtitle={s.subtitle} seeAll={s.seeAll}>
+			{#each s.albums as album (album.id)}
+				{#if album.reason}
+					<div class="reasoned album">
+						<AlbumCard {album} />
+						<span class="reason">{album.reason}</span>
+					</div>
+				{:else}
+					<AlbumCard {album} />
+				{/if}
+			{/each}
+		</Shelf>
+	{:else}
+		<Shelf title={s.title}>
+			{#each s.playlists as playlist (playlist.id)}<PlaylistCard {playlist} />{/each}
+		</Shelf>
+	{/if}
 {/snippet}
 
 <div class="page">
@@ -186,89 +332,16 @@
 	</div>
 	<p class="greet muted"></p>
 
-	{#await data}
+	{#if shelvesError}
+		<ErrorState error={shelvesError} retry={() => (data = load())} />
+	{:else if !shelves}
 		<div class="spinner"></div>
-	{:then d}
-		{#if !d.newest.length}
-			{#await recent then list}
-				{#if list.length}
-					<Shelf title="Recently Played" size="lg">
-						{#each list as song, i (song.id)}
-							<SongCard {song} queue={list} index={i} />
-						{/each}
-					</Shelf>
-				{/if}
-			{/await}
-			{@render lastfm()}
-			{#await hits then list}{@render songs("Today's Hits", list)}{/await}
-			{#await trending then list}{@render songs(
-					"Trending Songs",
-					list,
-				)}{/await}
-		{:else}
-			{#await recent then list}
-				{#if list.length}
-					<Shelf title="Recently Played" size="lg">
-						{#each list as song, i (song.id)}
-							<SongCard {song} queue={list} index={i} />
-						{/each}
-					</Shelf>
-				{/if}
-			{/await}
-			{#await trending then list}{@render songs(
-					"Trending Songs",
-					list,
-				)}{/await}
-			{@render lastfm()}
-			{#await hits then list}{@render songs("Today's Hits", list)}{/await}
-
-			{#if d.newest.length}
-				<Shelf title="Recently Added" seeAll="#/recent">
-					{#each d.newest as album (album.id)}<AlbumCard
-							{album}
-						/>{/each}
-				</Shelf>
-			{/if}
-			{#await picks then list}{@render songs("Top Picks for You", list)}{/await}
-			{#if d.frequent.length}
-				<Shelf title="Heavy Rotation">
-					{#each d.frequent as album (album.id)}<AlbumCard
-							{album}
-						/>{/each}
-				</Shelf>
-			{/if}
-			{#await starred then list}
-				{#if list.length}
-					<Shelf title="Favorite Albums" seeAll="#/albums">
-						{#each list as album (album.id)}<AlbumCard {album} />{/each}
-					</Shelf>
-				{/if}
-			{/await}
-			{#if d.random.length}
-				<Shelf title="Rediscover" seeAll="#/albums">
-					{#each d.random as album (album.id)}<AlbumCard
-							{album}
-						/>{/each}
-				</Shelf>
-			{/if}
-		{/if}
-	{:catch error}
-		<ErrorState {error} retry={() => (data = load())} />
-	{/await}
-	{#await popularPlaylists then list}
-		{#if list.length}
-			<Shelf title="Popular Playlists">
-				{#each list as playlist (playlist.id)}<PlaylistCard {playlist} />{/each}
-			</Shelf>
-		{/if}
-	{/await}
-	{#await newReleases then list}
-		{#if list.length}
-			<Shelf title="New Releases">
-				{#each list as album (album.id)}<AlbumCard {album} />{/each}
-			</Shelf>
-		{/if}
-	{/await}
+	{/if}
+	{#if shelves || shelvesError}
+		{#each plan(shelves) as s (s.key)}
+			{@render section(s)}
+		{/each}
+	{/if}
 </div>
 
 <style>
@@ -338,6 +411,10 @@
 		font-size: 12px;
 		color: var(--text-2);
 		text-align: center;
+	}
+	/* Album card titles are left-aligned: keep the caption under them. */
+	.reasoned.album .reason {
+		text-align: left;
 	}
 	.picks-head .btn {
 		min-width: 0;

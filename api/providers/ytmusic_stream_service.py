@@ -563,7 +563,11 @@ class YTMusicStreamService:
         if not seeds:
             return []
 
-        results = await asyncio.gather(*(self._get_radio_for_video_cached(vid, limit=25) for vid in seeds))
+        # One seed (a station) has to fill the whole list from its own mix.
+        per_seed = max(25, limit) if len(seeds) == 1 else 25
+        results = await asyncio.gather(
+            *(self._get_radio_for_video_cached(vid, limit=per_seed) for vid in seeds)
+        )
 
         score: Counter = Counter()
         info: dict[str, dict] = {}

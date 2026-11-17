@@ -574,7 +574,10 @@ async def lastfm_usernames() -> set[str]:
 # --- playback quality -------------------------------------------------------
 
 DEFAULT_QUALITY = "HI_RES_LOSSLESS"
-QUALITY_VALUES = ("HI_RES_LOSSLESS", "LOSSLESS", "HIGH")
+# HI_RES_LOSSLESS / LOSSLESS / HIGH are asked of the lossless (Eclipse) source, which
+# has its own HIGH (AAC); LOW skips that source and streams YouTube through yt-dlp.
+QUALITY_VALUES = ("HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "LOW")
+YT_ONLY_QUALITY = "LOW"
 
 
 def _get_quality(user_id: str) -> str:

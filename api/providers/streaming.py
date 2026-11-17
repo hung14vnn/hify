@@ -32,10 +32,41 @@ _MAX_REDIRECTS = 3
 def _content_disposition(artist: str, title: str, content_type: str) -> str:
     ext = "flac" if "flac" in content_type else ("opus" if ("webm" in content_type or "ogg" in content_type) else ("m4a" if "mp4" in content_type else "mp3"))
     name = f"{artist} - {title}".strip(" -") or "track"
-    safe_ascii = re.sub(r'[^\w\s.-]', '', name).strip() or "track"
+    # The plain `filename` must be ASCII: header values are latin-1, and \w alone keeps
+    # letters such as "ơ"/"ư", which made every Vietnamese title a 500. Strip the
+    # accents for it; the full name still goes in `filename*`.
+    folded = unicodedata.normalize("NFKD", name.replace("đ", "d").replace("Đ", "D"))
+    folded = folded.encode("ascii", "ignore").decode("ascii")
+    safe_ascii = re.sub(r"[^\w\s.-]", "", folded, flags=re.ASCII).strip() or "track"
     filename_ascii = f"{safe_ascii}.{ext}"
     filename_utf8 = quote(f"{name}.{ext}")
     return f'attachment; filename="{filename_ascii}"; filename*=UTF-8\'\'{filename_utf8}'
+
+
+def _ffmpeg_output(content_type: str, seeking: bool) -> tuple[str, str, str]:
+    """(codec, muxer, Content-Type) for an ffmpeg remux, keeping the source codec.
+
+    Every output here restarts its timestamps at 0 after `-ss` (verified with
+    ffprobe), which the player relies on to add its own offset.
+    - FLAC: a stream copy keeps the source's frame numbers and STREAMINFO, so a seeked
+      stream claims to start at the offset with the full length, and browsers disagree
+      on the clock. Re-encoding is still bit-exact and ~100x realtime at 24/192.
+    - AAC (the lossless source's HIGH, YouTube m4a): copied into ADTS. It used to be
+      re-encoded to FLAC, several times the bytes for no quality gain.
+    - Opus/Vorbis (YouTube webm): copied into Ogg, which also gets the right length.
+    """
+    ct = (content_type or "").lower()
+    if "flac" in ct:
+        return ("flac" if seeking else "copy"), "flac", "audio/flac"
+    # YouTube's StreamInfo carries the file extension ("m4a", "webm"), not a MIME type.
+    if "mp4" in ct or "aac" in ct or "m4a" in ct:
+        return "copy", "adts", "audio/aac"
+    if "mpeg" in ct or "mp3" in ct:
+        return "copy", "mp3", "audio/mpeg"
+    if "webm" in ct or "ogg" in ct or "opus" in ct:
+        return "copy", "ogg", "audio/ogg"
+    # Unknown codec: a lossless FLAC encode always plays.
+    return "flac", "flac", "audio/flac"
 
 
 def is_ios_user_agent(ua: str | None) -> bool:
@@ -290,17 +321,11 @@ class StreamService:
             cmd.extend(["-user_agent", user_agent])
         if seeking:
             cmd.extend(["-ss", f"{time_offset:.2f}"])
-        # A stream copy keeps the source's FLAC frame numbers and STREAMINFO, so a
-        # seeked stream claims to start at the offset with the full track length, and
-        # browsers disagree on whether currentTime starts at 0 or at the offset (the
-        # player's clock then jumped). Re-encoding is still lossless (bit-exact), runs
-        # ~100x realtime even at 24/192, and restarts timestamps at 0 with a correct
-        # length. It is also the only option when the source isn't FLAC to begin with.
-        codec = "flac" if seeking or content_type != "audio/flac" else "copy"
+        codec, muxer, out_type = _ffmpeg_output(content_type, seeking)
         cmd.extend([
             "-i", url,
             "-c:a", codec,
-            "-f", "flac",
+            "-f", muxer,
             "pipe:1",
         ])
         async def body() -> AsyncIterator[bytes]:
@@ -332,9 +357,8 @@ class StreamService:
                         except Exception:
                             pass
 
-        # The output is always a FLAC stream, whatever the source container was.
         headers = {
-            "Content-Type": "audio/flac",
+            "Content-Type": out_type,
             "Content-Encoding": "identity",
             "Accept-Ranges": "none",
         }
@@ -345,7 +369,7 @@ class StreamService:
             body(),
             status_code=200,
             headers=headers,
-            media_type="audio/flac",
+            media_type=out_type,
         )
 
     async def _proxy_yt(
@@ -363,7 +387,7 @@ class StreamService:
             info = await self._ytmusic.stream_info(video_id, fmt=format_name)
             return await self._proxy_ffmpeg(
                 info.audio_url,
-                "audio/flac",
+                info.content_type,
                 time_offset=time_offset,
                 user_agent=info.http_headers.get("User-Agent"),
             )
@@ -436,11 +460,16 @@ class StreamService:
             flac_duration = None
         else:
             flac_artist, flac_title, flac_duration = artist, title, duration
-        flac = await self._flac.resolve(
-            artist=flac_artist,
-            title=flac_title,
-            duration_s=flac_duration,
-            quality=quality,
+        # LOW: data saver, straight to YouTube (yt-dlp) without asking the lossless source.
+        flac = (
+            None
+            if quality == db.YT_ONLY_QUALITY
+            else await self._flac.resolve(
+                artist=flac_artist,
+                title=flac_title,
+                duration_s=flac_duration,
+                quality=quality,
+            )
         )
         if flac:
             try:

@@ -468,9 +468,76 @@ async def recently_played(request: Request, user=Depends(current_user)) -> JSONR
     return _ok(recentlyPlayedSongs={"song": songs})
 
 
+def _watch_track(track: dict[str, Any]) -> dict[str, Any]:
+    """A radio (watch playlist) track in the shape `song_from_yt` reads: it carries
+    `length` ("3:46") and `thumbnail` instead of a duration and `thumbnails`."""
+    out = dict(track)
+    if "thumbnails" not in out and out.get("thumbnail"):
+        out["thumbnails"] = out["thumbnail"]
+    length = str(out.get("length") or "")
+    if not out.get("duration_seconds") and re.fullmatch(r"\d+(:\d{1,2}){1,2}", length):
+        seconds = 0
+        for part in length.split(":"):
+            seconds = seconds * 60 + int(part)
+        out["duration_seconds"] = seconds
+    return out
+
+
+async def _seed_video_id(
+    services: dict[str, Any], song_id: str = "", artist: str = "", title: str = ""
+) -> str | None:
+    """The YouTube Music video a seed track maps to (radio mixes are keyed by video)."""
+    if song_id.startswith("yt-"):
+        return song_id[3:] or None
+    if song_id.startswith("ytv-"):
+        return song_id[4:] or None
+    if song_id:
+        meta = await services["stream"].song_meta(song_id)
+        if meta:
+            artist = str(meta.get("artist") or "")
+            title = str(meta.get("title") or "")
+    if not title:
+        return None
+    ytmusic: YTMusicStreamService = services["ytmusic"]
+    results = await ytmusic.search_tracks(f"{artist} {title}".strip(), limit=1)
+    return str(results[0]["videoId"]) if results else None
+
+
 @router.get("/getSimilarSongs2")
 async def similar_songs(request: Request, user=Depends(current_user)) -> JSONResponse:
-    return _ok(similarSongs2={"song": []})
+    """Songs like the seeds, from YouTube Music radio mixes.
+
+    Two callers: Create Station sends one `id`; Smart Discover (queue suggestions)
+    sends up to five `artist`/`title` pairs, repeated in order.
+    """
+    services = _services(request)
+    count = max(1, min(_int(request.query_params.get("count"), 50), 100))
+    params = request.query_params
+    seeds = [{"song_id": song_id} for song_id in params.getlist("id") if song_id]
+    seeds += [
+        {"artist": artist, "title": title}
+        for artist, title in zip(params.getlist("artist"), params.getlist("title"))
+        if title
+    ]
+    seeds = seeds[:5]
+    if not seeds:
+        return _ok(similarSongs2={"song": []})
+    resolved = await asyncio.gather(
+        *(_seed_video_id(services, **seed) for seed in seeds), return_exceptions=True
+    )
+    video_ids = [vid for vid in resolved if isinstance(vid, str) and vid]
+    for seed, result in zip(seeds, resolved):
+        if isinstance(result, Exception):
+            logger.warning("similar songs: seed %s failed: %s", seed, result)
+    if not video_ids:
+        return _ok(similarSongs2={"song": []})
+    ytmusic: YTMusicStreamService = services["ytmusic"]
+    try:
+        tracks = await ytmusic.get_smart_discover(video_ids, limit=count)
+    except Exception as exc:  # noqa: BLE001 - no suggestions beats an error toast
+        logger.warning("similar songs failed: %s", exc)
+        tracks = []
+    return _ok(similarSongs2={"song": [song_from_yt(_watch_track(track)) for track in tracks]})
 
 
 @router.get("/getGenres")
@@ -680,9 +747,145 @@ async def set_lastfm_scrobbling(request: Request, user=Depends(current_user)) ->
     return _ok(lastfm=status)
 
 
+_RECS_TTL_S = 30 * 60
+_RECS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+async def _recommended_songs(services: dict[str, Any], lastfm: LastfmService, username: str) -> list[dict[str, Any]]:
+    """A radio blend seeded by tracks the user actually plays a lot lately."""
+    tracks = await lastfm.top_tracks(username, period="1month", limit=30)
+    if len(tracks) < 5:
+        tracks += await lastfm.top_tracks(username, period="overall", limit=30)
+    if not tracks:
+        return []
+    pool = list(dict.fromkeys(tracks))[:15]
+    seeds = random.sample(pool, min(5, len(pool)))
+    resolved = await asyncio.gather(
+        *(_seed_video_id(services, artist=artist, title=title) for artist, title in seeds),
+        return_exceptions=True,
+    )
+    video_ids = [vid for vid in resolved if isinstance(vid, str) and vid]
+    if not video_ids:
+        return []
+    ytmusic: YTMusicStreamService = services["ytmusic"]
+    radio = await ytmusic.get_smart_discover(video_ids, limit=25)
+    played = {(a.lower(), t.lower()) for a, t in tracks}
+    songs = [song_from_yt(_watch_track(track)) for track in radio]
+    # Recommendations, not a replay of the user's own top list.
+    return [s for s in songs if (str(s.get("artist", "")).lower(), str(s.get("title", "")).lower()) not in played]
+
+
+async def _recommended_artists(services: dict[str, Any], lastfm: LastfmService, username: str) -> list[dict[str, Any]]:
+    """Artists similar to the user's favourites that they don't already listen to."""
+    top = await lastfm.top_artists(username, period="3month", limit=50)
+    if len(top) < 5:
+        top += await lastfm.top_artists(username, period="overall", limit=50)
+    if not top:
+        return []
+    known = {name.lower() for name in top}
+    seeds = list(dict.fromkeys(top))[:5]
+    similar = await asyncio.gather(*(lastfm.similar_artists(seed, limit=12) for seed in seeds))
+    picks: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    # Round-robin across seeds so one favourite doesn't fill the whole shelf.
+    for i in range(12):
+        for seed, names in zip(seeds, similar):
+            if i < len(names) and names[i].lower() not in known and names[i].lower() not in seen:
+                seen.add(names[i].lower())
+                picks.append((names[i], seed))
+    picks = picks[:12]
+    spotify: SpotApiClient = services["spotify"]
+
+    async def card(name: str, seed: str) -> dict[str, Any]:
+        item: dict[str, Any] = {"id": name, "name": name}  # getArtist also resolves a plain name
+        try:
+            results, _ = await spotify.search_artists(name, limit=1)
+            if results:
+                item = artist_from_spotify(results[0])
+        except Exception as exc:  # noqa: BLE001 - a card without a picture is still a pick
+            logger.debug("spotify artist lookup failed for %s: %s", name, exc)
+        item["reason"] = f"Similar to {seed}"
+        return item
+
+    return list(await asyncio.gather(*(card(name, seed) for name, seed in picks)))
+
+
+async def _recommended_albums(services: dict[str, Any], artists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One album from each recommended artist (a full album over singles/EPs)."""
+    spotify: SpotApiClient = services["spotify"]
+
+    async def pick(artist: dict[str, Any]) -> dict[str, Any] | None:
+        artist_id = str(artist.get("id") or "")
+        if not artist_id.startswith("sa-"):
+            return None  # no catalog match: nothing to open
+        albums, _, _ = await spotify.get_artist_albums(artist_id[3:], limit=10)
+        chosen = next((a for a in albums if a.get("album_type") == "album"), albums[0] if albums else None)
+        if not chosen:
+            return None
+        item = album_from_spotify(chosen)
+        if artist.get("reason"):
+            item["reason"] = artist["reason"]
+        return item
+
+    results = await asyncio.gather(*(pick(artist) for artist in artists[:10]), return_exceptions=True)
+    return [album for album in results if isinstance(album, dict)]
+
+
 @router.get("/getLastfmRecommendations")
 async def get_lastfm_recommendations(request: Request, user=Depends(current_user)) -> JSONResponse:
-    return _ok(lastfmRecommendations={"shelf": []})
+    """Home's "For You" shelves from the linked Last.fm account (empty when not linked)."""
+    services = _services(request)
+    lastfm: LastfmService = services["lastfm"]
+    uid = user["user_id"]
+    username = await lastfm.linked_username(uid)
+    if not username:
+        return _ok(lastfmRecommendations={"shelf": []})
+    refresh = str(request.query_params.get("refresh") or "").lower() in {"1", "true", "yes"}
+    cached = _RECS_CACHE.get(uid)
+    if cached and not refresh and time.monotonic() - cached[0] < _RECS_TTL_S:
+        return _ok(lastfmRecommendations={"shelf": cached[1]})
+
+    songs, artists = await asyncio.gather(
+        _recommended_songs(services, lastfm, username),
+        _recommended_artists(services, lastfm, username),
+        return_exceptions=True,
+    )
+    albums: list[dict[str, Any]] | BaseException = []
+    if isinstance(artists, list) and artists:
+        try:
+            albums = await _recommended_albums(services, artists)
+        except Exception as exc:  # noqa: BLE001 - the other shelves still show
+            albums = exc
+    shelves: list[dict[str, Any]] = []
+    if isinstance(songs, list) and songs:
+        shelves.append({
+            "key": "lastfm-songs",
+            "kind": "song",
+            "title": "Made for You",
+            "subtitle": "Based on what you play on Last.fm",
+            "song": songs,
+        })
+    if isinstance(artists, list) and artists:
+        shelves.append({
+            "key": "lastfm-artists",
+            "kind": "artist",
+            "title": "Artists You Might Like",
+            "artist": artists,
+        })
+    if isinstance(albums, list) and albums:
+        shelves.append({
+            "key": "lastfm-albums",
+            "kind": "album",
+            "title": "Albums You Might Like",
+            "album": albums,
+        })
+    for label, result in (("songs", songs), ("artists", artists), ("albums", albums)):
+        if isinstance(result, Exception):
+            logger.warning("lastfm recommendations (%s) failed: %s", label, result)
+    # Only keep a full answer: a partial or empty one is retried on the next visit.
+    if len(shelves) == 3:
+        _RECS_CACHE[uid] = (time.monotonic(), shelves)
+    return _ok(lastfmRecommendations={"shelf": shelves})
 
 
 # --- library admin (removed in the slim app) --------------------------------

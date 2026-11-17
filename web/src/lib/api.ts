@@ -50,6 +50,22 @@ export function getSession() {
 	return session;
 }
 
+/**
+ * Bearer-token sessions (this server's /auth/login) carry no username, but offline
+ * copies are stored per username: without one, downloading failed with "Not signed
+ * in" and saved copies were never found. Fill it in once from getUser and persist it,
+ * so it is there when the device is actually offline. Auth ignores it with an apiKey.
+ */
+export function rememberUsername(name: string | undefined) {
+	if (!session || session.username || !name) return;
+	session = { ...session, username: name };
+	try {
+		localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+	} catch {
+		/* storage unavailable */
+	}
+}
+
 export function clearSession() {
 	session = null;
 	clearCache();
@@ -321,6 +337,13 @@ export async function login(opts: { server: string; username?: string; password?
 				if (data.token) {
 					const s: Session = { base: root, apiKey: data.token };
 					await call('ping', {}, s);
+					// Offline copies are keyed by username (see rememberUsername).
+					try {
+						const me = await call('getUser', { username: 'me' }, s);
+						s.username = me.user?.username || undefined;
+					} catch {
+						/* loadMe() fills it in later */
+					}
 					session = s;
 					localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
 					return s;
@@ -759,7 +782,8 @@ export async function connectLastfm(): Promise<string> {
 	return data.url;
 }
 
-export type PlaybackQuality = 'HI_RES_LOSSLESS' | 'LOSSLESS' | 'HIGH';
+/** HIGH is the lossless source's own lossy tier (AAC); LOW streams YouTube via yt-dlp. */
+export type PlaybackQuality = 'HI_RES_LOSSLESS' | 'LOSSLESS' | 'HIGH' | 'LOW';
 
 function qualityEndpoint(): string {
 	if (!session) throw new SubsonicError(10, 'Not signed in');

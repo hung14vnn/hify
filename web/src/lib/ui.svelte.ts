@@ -1,5 +1,5 @@
 import { SvelteSet } from 'svelte/reactivity';
-import { addToPlaylist, cached, createPlaylist, getPlaylists, getStarred, getUser, setStarred, type UserInfo } from './api';
+import { addToPlaylist, cached, createPlaylist, getPlaylists, getStarred, getUser, rememberUsername, setStarred, type UserInfo } from './api';
 import type { Album, Artist, Playlist, Song } from './types';
 
 export interface MenuItem {
@@ -129,6 +129,8 @@ class UI {
 	async loadMe() {
 		try {
 			this.me = await getUser();
+			// Sessions signed in before usernames were kept: offline storage needs one.
+			rememberUsername(this.me?.username);
 		} catch {
 			/* profile info is non-essential */
 		}

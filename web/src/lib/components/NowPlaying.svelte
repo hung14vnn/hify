@@ -199,7 +199,8 @@
 	const QUALITY_OPTIONS: { value: PlaybackQuality; label: string; detail: string }[] = [
 		{ value: "HI_RES_LOSSLESS", label: "Hi-Res Lossless", detail: "Up to 24-bit / 192 kHz" },
 		{ value: "LOSSLESS", label: "Lossless", detail: "CD · 16-bit / 44.1 kHz" },
-		{ value: "HIGH", label: "High", detail: "Lossy · lighter on data" }
+		{ value: "HIGH", label: "High", detail: "AAC · same source, lighter on data" },
+		{ value: "LOW", label: "Low", detail: "YouTube · least data" }
 	];
 
 	getPlaybackQuality()

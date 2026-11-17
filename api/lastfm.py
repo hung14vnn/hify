@@ -28,6 +28,16 @@ def _sign(params: dict[str, Any], secret: str) -> str:
     return hashlib.md5((payload + secret).encode("utf-8")).hexdigest()
 
 
+def _items(container: Any, key: str) -> list[dict[str, Any]]:
+    """Last.fm lists: a single result comes back as an object, not a one-item list."""
+    if not isinstance(container, dict):
+        return []
+    value = container.get(key)
+    if isinstance(value, dict):
+        return [value]
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
 class LastfmService:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._http = client
@@ -62,6 +72,56 @@ class LastfmService:
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("lastfm %s failed: %s", method, type(exc).__name__)
             return None
+
+    async def _public(self, method: str, **params: Any) -> dict[str, Any] | None:
+        """An unsigned read (user/artist data): only the API key is needed."""
+        if not settings.lastfm_api_key:
+            return None
+        payload = {
+            "method": method,
+            "api_key": settings.lastfm_api_key,
+            "format": "json",
+            **{key: value for key, value in params.items() if value is not None},
+        }
+        try:
+            response = await self._http.get(_API, params=payload, timeout=10.0)
+            data = response.json()
+            if isinstance(data, dict) and data.get("error"):
+                logger.warning("lastfm %s rejected: error %s", method, data["error"])
+                return None
+            response.raise_for_status()
+            return data if isinstance(data, dict) else None
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("lastfm %s failed: %s", method, type(exc).__name__)
+            return None
+
+    async def linked_username(self, user_id: str) -> str | None:
+        connection = await db.lastfm_get(user_id)
+        return str((connection or {}).get("username") or "") or None
+
+    async def top_artists(self, username: str, period: str = "3month", limit: int = 50) -> list[str]:
+        data = await self._public("user.getTopArtists", user=username, period=period, limit=limit)
+        items = _items((data or {}).get("topartists"), "artist")
+        return [str(item["name"]) for item in items if item.get("name")]
+
+    async def top_tracks(
+        self, username: str, period: str = "1month", limit: int = 30
+    ) -> list[tuple[str, str]]:
+        """(artist, title) pairs, most played first."""
+        data = await self._public("user.getTopTracks", user=username, period=period, limit=limit)
+        items = _items((data or {}).get("toptracks"), "track")
+        out = []
+        for item in items:
+            artist = item.get("artist")
+            name = artist.get("name") or artist.get("#text") if isinstance(artist, dict) else artist
+            if name and item.get("name"):
+                out.append((str(name), str(item["name"])))
+        return out
+
+    async def similar_artists(self, artist: str, limit: int = 10) -> list[str]:
+        data = await self._public("artist.getSimilar", artist=artist, limit=limit, autocorrect=1)
+        items = _items((data or {}).get("similarartists"), "artist")
+        return [str(item["name"]) for item in items if item.get("name")]
 
     async def connect_url(self, user_id: str) -> tuple[str, str]:
         async with self._link_lock:
