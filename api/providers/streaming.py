@@ -9,7 +9,7 @@ import re
 import socket
 import unicodedata
 from typing import AsyncIterator
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 from fastapi.responses import StreamingResponse
@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 
 _STREAM_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 _MAX_REDIRECTS = 3
+
+
+def _content_disposition(artist: str, title: str, content_type: str) -> str:
+    ext = "opus" if ("webm" in content_type or "ogg" in content_type) else ("m4a" if "mp4" in content_type else "mp3")
+    name = f"{artist} - {title}".strip(" -") or "track"
+    safe_ascii = re.sub(r'[^\w\s.-]', '', name).strip() or "track"
+    filename_ascii = f"{safe_ascii}.{ext}"
+    filename_utf8 = quote(f"{name}.{ext}")
+    return f'attachment; filename="{filename_ascii}"; filename*=UTF-8\'\'{filename_utf8}'
 
 
 def _blocked_ip(raw: str) -> bool:
@@ -423,3 +432,51 @@ class StreamService:
             artist, title, fmt=settings.yt_format, expected_duration_s=duration
         )
         return await self._proxy_yt(info.video_id, range_header, time_offset)
+
+    async def download(
+        self,
+        song_id: str,
+        range_header: str | None = None,
+    ) -> StreamingResponse:
+        """Download stream: directly resolves through yt-dlp (YouTube Music) without FLAC remuxing."""
+        if song_id.startswith("kr-"):
+            raise SubsonicError(70, "Karaoke is not available")
+        if song_id.startswith("ytv-"):
+            if not re.fullmatch(r"[A-Za-z0-9_-]{11}", song_id[4:]):
+                raise SubsonicError(70, "Invalid YouTube video id")
+            resp = await self._proxy_yt(song_id[4:], range_header)
+            content_type = resp.headers.get("Content-Type", "audio/webm")
+            resp.headers["Content-Disposition"] = _content_disposition("YouTube", song_id[4:], content_type)
+            return resp
+
+        is_yt = song_id.startswith("yt-")
+        if not is_yt and not song_id.startswith("st-"):
+            raise SubsonicError(70, "Invalid id type")
+
+        meta = await self.song_meta(song_id)
+        if meta is None:
+            if is_yt:
+                video_id = song_id[3:]
+                resp = await self._proxy_yt(video_id, range_header)
+                content_type = resp.headers.get("Content-Type", "audio/webm")
+                resp.headers["Content-Disposition"] = _content_disposition("YouTube", video_id, content_type)
+                return resp
+            raise SubsonicError(70, "Song not found")
+
+        artist = self._artist(meta)
+        title = str(meta.get("title") or "")
+        duration = meta.get("duration")
+
+        # For download, always choose stream from yt-dlp (YouTube Music)
+        if is_yt:
+            video_id = song_id[3:]
+        else:
+            info = await self._ytmusic.search(
+                artist, title, fmt=settings.yt_format, expected_duration_s=duration
+            )
+            video_id = info.video_id
+
+        resp = await self._proxy_yt(video_id, range_header)
+        content_type = resp.headers.get("Content-Type", "audio/webm")
+        resp.headers["Content-Disposition"] = _content_disposition(artist, title, content_type)
+        return resp

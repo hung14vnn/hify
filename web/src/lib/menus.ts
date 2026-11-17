@@ -14,7 +14,7 @@ export async function startStation(song: Song) {
 	}
 }
 
-import { getSession } from './api';
+import { downloadUrl, getSession } from './api';
 import { deleteOfflineTrack, downloadOfflineTrack, downloadOfflineTracks, getOfflineTrackMetadata } from './offline';
 
 /**
@@ -67,6 +67,20 @@ export async function songMenu(song: Song, extra: MenuItem[] = []): Promise<Menu
 						ui.showToast(e.message || 'Download failed');
 					}
 				}
+			}
+		},
+		{
+			label: 'Save Audio File',
+			icon: 'download',
+			action: () => {
+				const url = downloadUrl(song.id);
+				if (!url) return;
+				const a = document.createElement('a');
+				a.href = url;
+				document.body.appendChild(a);
+				a.click();
+				a.remove();
+				ui.showToast('Downloading file…');
 			}
 		},
 		{

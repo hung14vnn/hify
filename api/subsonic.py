@@ -73,7 +73,7 @@ async def get_user(request: Request, user=Depends(current_user)) -> JSONResponse
             "scrobblingEnabled": bool(lastfm["linked"] and lastfm["scrobbling"]),
             "adminRole": user["role"] == "admin",
             "settingsRole": False,
-            "downloadRole": False,
+            "downloadRole": True,
             "uploadRole": False,
             "playlistRole": True,
             "coverArtRole": False,
@@ -179,6 +179,19 @@ async def stream(request: Request, user=Depends(current_user)):
         range_header,
         user["user_id"],
         time_offset=offset_s,
+    )
+
+
+@router.get("/download")
+async def download(request: Request, user=Depends(current_user)):
+    services = _services(request)
+    song_id = request.query_params.get("id") or ""
+    if not song_id:
+        raise SubsonicError(70, "Song not found")
+    range_header = request.headers.get("range") or request.headers.get("Range")
+    return await services["stream"].download(
+        song_id,
+        range_header,
     )
 
 

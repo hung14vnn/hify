@@ -387,6 +387,11 @@ export function streamUrl(id: string, bust?: number, timeOffset?: number) {
 	return buildUrl(session, 'stream', params);
 }
 
+export function downloadUrl(id: string) {
+	if (!session) return '';
+	return buildUrl(session, 'download', { id });
+}
+
 /**
  * For secondary shelves: servers may reject optional list types (DroppedNeedle has
  * no ratings, so `highest` fails), and one failed shelf shouldn't blank the page.

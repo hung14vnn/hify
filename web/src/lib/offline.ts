@@ -1,5 +1,5 @@
 import { del, get, getMany, keys, set, createStore } from 'idb-keyval';
-import { getSession, streamUrl } from './api';
+import { downloadUrl, getSession, streamUrl } from './api';
 import type { Song } from './types';
 
 const AUDIO_DB = createStore('player-offline-audio-v1', 'tracks');
@@ -117,7 +117,7 @@ export async function downloadOfflineTrack(song: Song): Promise<OfflineTrackMeta
 	if (!session?.username) throw new OfflineStorageError('DOWNLOAD', 'Not signed in');
 	
 	const userId = session.username;
-	const url = streamUrl(song.id);
+	const url = downloadUrl(song.id);
 	const key = encodedKey(userId, song.id);
 
 	let response: Response;
@@ -152,10 +152,14 @@ export async function downloadOfflineTrack(song: Song): Promise<OfflineTrackMeta
 		coverUrl: song.coverArt,
 		trackNumber: song.track,
 		discNumber: song.discNumber,
-		format: song.suffix ?? 'mp3',
+		format: (blob.type || '').toLowerCase().includes('webm') || (blob.type || '').toLowerCase().includes('ogg')
+			? 'opus'
+			: (blob.type || '').toLowerCase().includes('mp4')
+				? 'm4a'
+				: (song.suffix ?? 'opus'),
 		durationSeconds: song.duration,
 		sizeBytes: blob.size,
-		mimeType: blob.type || 'audio/mpeg',
+		mimeType: blob.type || 'audio/webm',
 		storedAt: Date.now()
 	};
 	
