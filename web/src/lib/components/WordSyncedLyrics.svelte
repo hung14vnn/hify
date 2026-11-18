@@ -24,7 +24,7 @@
 	}
 
 	const AM_LYRICS_CDN_URL =
-		"https://cdn.jsdelivr.net/npm/@uimaxbai/am-lyrics@1.7.2/dist/src/am-lyrics.min.js";
+		"https://cdn.jsdelivr.net/npm/@uimaxbai/am-lyrics/dist/src/am-lyrics.min.js";
 
 
 	let cdnPromise: Promise<void> | null = null;
