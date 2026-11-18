@@ -5,8 +5,10 @@
 		currentTime: number;
 		duration: number;
 		fetchLyrics?: () => Promise<void> | void;
+		updateComplete?: Promise<unknown>;
 		/** Lit state, private in its typings but readable at runtime. */
 		lyrics?: unknown[];
+		isLoading?: boolean;
 	};
 
 	interface Props {
@@ -224,6 +226,33 @@
 		root.appendChild(style);
 	}
 
+	/**
+	 * am-lyrics fetches on its own whenever the song attributes change (its
+	 * `updated()` calls `fetchLyrics()`). Calling `fetchLyrics()` here as well
+	 * aborts that fetch and makes it resolve empty, which used to trip the
+	 * "unavailable" fallback while the real request was still in flight.
+	 * So: let Lit process the attributes, only fetch manually if it skipped,
+	 * then wait for whichever request is running to settle before deciding.
+	 */
+	async function fetchForSong(target: AmLyricsElement, key: string) {
+		try {
+			await target.updateComplete;
+		} catch {
+			/* the element can be torn down while updating */
+		}
+		if (disposed || key !== songKey) return;
+
+		if (!target.isLoading && !target.lyrics?.length) target.fetchLyrics?.();
+
+		const deadline = Date.now() + 30_000;
+		while (!disposed && key === songKey && target.isLoading) {
+			if (Date.now() >= deadline) break;
+			await new Promise((resolve) => setTimeout(resolve, 80));
+		}
+		if (disposed || key !== songKey) return;
+		if (!target.lyrics?.length) onunavailable();
+	}
+
 	// ---------------------------------------------------------------------------
 	// Lifecycle
 	// ---------------------------------------------------------------------------
@@ -286,7 +315,7 @@
 		return () => target.removeEventListener("line-click", handleLineClick);
 	});
 
-	// Đổi bài → cập nhật attribute và fetch lời (chỉ một lần mỗi bài)
+	// Đổi bài → cập nhật attribute; am-lyrics tự fetch, ta chỉ chờ kết quả.
 	$effect(() => {
 		const target = element;
 		songKey; // dependency
@@ -295,13 +324,7 @@
 		untrack(() => {
 			const key = songKey;
 			applyAttributes(target);
-			Promise.resolve(target.fetchLyrics?.())
-				.then(() => {
-					// Superseded by another song, or found something: nothing to do.
-					if (disposed || key !== songKey) return;
-					if (!target.lyrics?.length) onunavailable();
-				})
-				.catch(() => {});
+			void fetchForSong(target, key).catch(() => {});
 		});
 	});
 
