@@ -77,6 +77,14 @@ interface ObjectUrl {
 interface OfflineCopy {
 	id: string;
 	copy: ObjectUrl;
+	prefetched?: boolean;
+}
+
+interface NextPreparation {
+	id: string;
+	/** Transferred to load() if this track starts before the local read finishes. */
+	lookup: Promise<ObjectUrl | null> | null;
+	warm: AbortController;
 }
 
 interface BlobJob {
@@ -289,9 +297,8 @@ class Player {
 	history = $derived(this.index > 0 ? this.queue.slice(0, this.index) : []);
 	upNext = $derived(this.queue.slice(this.index + 1));
 	/** Next track in queue that will play when the current track ends. */
-	nextSong = $derived(
-		this.queue[this.index + 1] ?? (this.repeat === 'all' ? this.queue[0] : undefined)
-	);
+	nextSong = $derived(this.index < 0 || this.repeat === 'one' ? undefined :
+		this.queue[nextIndex(this.queue.length, this.index, this.repeat)]);
 	/** The song lyrics are for: the original while its karaoke version plays. */
 	lyricsSong = $derived(
 		this.karaoke && this.current?.id === this.karaoke.version.id ? this.karaoke.original : this.current
@@ -303,6 +310,9 @@ class Player {
 
 	private audio: HTMLAudioElement;
 	private readonly ios = isIOSDevice();
+	private readonly android = /Android/i.test(navigator.userAgent);
+	/** Native position at startup, until the new Android source makes progress. */
+	private androidStartTime: number | null = null;
 	/**
 	 * Web Audio engine (Settings › Playback), or null for plain <audio>. Chosen once per
 	 * page load: an element joined to a graph can't leave it, so a change needs a restart.
@@ -352,16 +362,10 @@ class Player {
 	 * downloaded for offline use, or prefetched into a blob while the current track plays.
 	 */
 	private nextReady: OfflineCopy | null = null;
-	/** Track id for which the offline lookup already came back empty (skips an await in load). */
-	private offlineMissFor: string | null = null;
+	private preparation: NextPreparation | null = null;
 	/** In-flight whole-track prefetch, and the last failure (for bounded retries). */
 	private blobJob: BlobJob | null = null;
 	private blobFailure: BlobFailure | null = null;
-	/**
-	 * Track ids whose server-side resolve was already triggered by `warmNext`. Not
-	 * aborted on track change: the server keeps (and caches) the work either way.
-	 */
-	private warmed = new Set<string>();
 	/**
 	 * Server length that playback ends at, or 0. iOS Safari misreads fragmented m4a
 	 * (YouTube Music streams), often at about double, then plays silence up to it.
@@ -529,6 +533,7 @@ class Player {
 			if (this.audio !== a) return;
 			this.buffering = false;
 			if (this.playRequested && a.paused) this.play();
+			if (this.playRequested && !this.switching) this.prefetchInWindow();
 		});
 		a.addEventListener('loadedmetadata', () => {
 			if (this.audio !== a) return;
@@ -607,14 +612,14 @@ class Player {
 		if (!this.current) return this.playList(songs);
 		this.queue.splice(this.index + 1, 0, ...songs);
 		this.unshuffled?.push(...songs);
-		this.persist();
+		this.queueChanged();
 	}
 
 	addToQueue(songs: Song[]) {
 		if (!this.current) return this.playList(songs);
 		this.queue.push(...songs);
 		this.unshuffled?.push(...songs);
-		this.persist();
+		this.queueChanged();
 	}
 
 	/** Spread songs through the not-yet-played part of the queue (Smart Discover). */
@@ -639,24 +644,29 @@ class Player {
 			...restSection
 		];
 		this.unshuffled?.push(...songs);
-		this.persist();
+		this.queueChanged();
 	}
 
 	removeAt(i: number) {
 		const index = removeAt(this.queue, this.index, i);
 		if (index === null) return;
 		this.index = index;
-		this.persist();
+		this.queueChanged();
 	}
 
 	clearUpNext(keepCount = 0) {
 		if (this.index + 1 + keepCount >= this.queue.length) return;
 		this.queue.splice(this.index + 1 + keepCount);
-		this.persist();
+		this.queueChanged();
 	}
 
 	moveUpNext(from: number, to: number) {
 		this.index = moveItem(this.queue, this.index, from, to);
+		this.queueChanged();
+	}
+
+	private queueChanged() {
+		this.prepareNext();
 		this.persist();
 	}
 
@@ -690,6 +700,8 @@ class Player {
 	/** Re-resolve the current track at the same position (e.g. new quality). */
 	reloadCurrent() {
 		if (!this.current) return;
+		this.clearPreparation();
+		if (this.playingOffline?.prefetched) this.releaseOffline();
 		void this.load(this.index, this.playRequested, this.time);
 	}
 
@@ -704,9 +716,9 @@ class Player {
 		this.audio.pause();
 	}
 
-	next() {
+	next(automatic = false) {
 		const i = nextIndex(this.queue.length, this.index, this.repeat);
-		if (i >= 0) this.load(i, true);
+		if (i >= 0) this.load(i, true, 0, automatic ? 'advance' : 'selected');
 		else {
 			this.pause();
 			this.seek(0);
@@ -867,7 +879,7 @@ class Player {
 			this.unshuffled = null;
 		}
 		this.applyReplayGain(true);
-		this.persist();
+		this.queueChanged();
 	}
 
 	/**
@@ -992,8 +1004,7 @@ class Player {
 
 	cycleRepeat() {
 		this.repeat = cycleRepeat(this.repeat);
-		if (this.repeat === 'one') this.cancelPreroll();
-		this.persist();
+		this.queueChanged();
 	}
 
 	/** Opens the system device picker; false when this browser has none. */
@@ -1010,7 +1021,7 @@ class Player {
 	 * `playingOffline`, `nextReady`, or known to have no offline copy, there is no
 	 * await at all, which is what lets a track change from `ended` work on a hidden page.
 	 */
-	private async load(i: number, autoplay: boolean, startAt = 0) {
+	private async load(i: number, autoplay: boolean, startAt = 0, reason: 'selected' | 'advance' | 'stream-retry' = 'selected') {
 		// Karaoke is per song: moving to another puts the original back in the queue.
 		const picked = this.queue[i];
 		if ((this.karaoke || this.karaokeWaiting) && picked && picked.id !== this.karaoke?.version.id) {
@@ -1018,20 +1029,14 @@ class Player {
 		}
 		const song = this.queue[i];
 		if (!song) return;
+		const incoming = this.preparation?.id === song.id ? this.preparation : null;
 		// A preroll only carries on into the song it was started for, from its start.
-		if (this.preroll && (song.id !== this.upcoming()?.id || !autoplay || startAt !== 0)) this.cancelPreroll();
+		if (this.preroll && (!incoming || !autoplay || startAt !== 0)) this.cancelPreroll();
 		// A handoff still finishing ends with the next change.
 		if (this.retiring) this.finishRetire(this.retiring.el);
 		const token = ++this.loadToken;
 		this.index = i;
-		this.standbyStreamId = null;
-		// A whole-track download for a song that is no longer next (most often the one
-		// starting now, which will stream instead) would only compete with the stream.
-		if (this.blobJob && this.blobJob.id !== this.upcoming()?.id) {
-			logPlayback('blob-cancel', `id=${this.blobJob.id}`);
-			this.blobJob.abort.abort();
-			this.blobJob = null;
-		}
+		this.androidStartTime = null;
 		this.error = null;
 		this.scrobbled = false;
 		this.durationCap = 0;
@@ -1063,6 +1068,11 @@ class Player {
 			}).catch(() => {});
 		}
 
+		// Android can suspend IndexedDB while the media session runs and the page
+		// still reports visible. Keep an automatic handoff or stream retry synchronous
+		// when online. A local copy that finished preparing always wins below.
+		const useStream = this.android && navigator.onLine &&
+			(reason === 'stream-retry' || (!!incoming && (reason === 'advance' || document.hidden)));
 		let offline: OfflineCopy | null = null;
 		if (this.playingOffline?.id === song.id) {
 			// Restarting the same track: keep its URL.
@@ -1071,14 +1081,14 @@ class Player {
 		} else if (this.nextReady?.id === song.id) {
 			offline = this.nextReady;
 			this.nextReady = null;
-		} else if (this.offlineMissFor === song.id) {
-			// prepareNextOffline already checked IndexedDB: no copy. Don't await again.
-			this.offlineMissFor = null;
-		} else {
-			// IndexedDB is local and safe to read in the background. If there is no
-			// explicitly downloaded copy, native <audio> remains the fallback.
+		} else if ((!incoming || incoming.lookup) && !useStream) {
+			// Take ownership of any local read already underway. A completed miss
+			// skips this await entirely, including during a background handoff.
+			const lookup = incoming?.lookup ?? lookupOffline(song.id);
+			if (incoming) incoming.lookup = null;
 			this.switching = true;
-			const copy = await lookupOffline(song.id);
+			this.prepareNext();
+			const copy = await lookup;
 			// The user moved on to another track while we were looking.
 			if (this.destroyed || token !== this.loadToken) {
 				copy?.revoke();
@@ -1087,6 +1097,7 @@ class Player {
 			if (copy) offline = { id: song.id, copy };
 		}
 		this.switching = false;
+		const wantsPlayback = this.playRequested;
 		const outgoing = this.playingOffline;
 		this.playingOffline = offline;
 		const serverSeek = !offline && seeksOnServer(song);
@@ -1095,7 +1106,7 @@ class Player {
 		// The server already starts the stream at startAt: don't seek again on metadata.
 		if (this.streamOffset) this.pendingSeek = 0;
 		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0, this.streamOffset);
-		const handoff = autoplay && startAt === 0 && this.standbyHolds(src);
+		const handoff = wantsPlayback && startAt === 0 && this.standbyHolds(src);
 
 		logPlayback(
 			'load',
@@ -1109,7 +1120,7 @@ class Player {
 			this.cancelPreroll();
 			outgoing?.copy.revoke();
 			this.output?.quickFadeIn(this.audio, 0.22);
-			this.audio.autoplay = autoplay;
+			this.audio.autoplay = wantsPlayback;
 			this.applyVolume(this.audio);
 			this.audio.src = src;
 			this.audio.load();
@@ -1118,9 +1129,8 @@ class Player {
 		this.output?.trackChanged(isLossless(song));
 		this.applyReplayGain();
 		void this.learnCodec(song, Boolean(offline));
-		// The standby copy was either just promoted or no longer matches `nextReady`.
-		this.primeStandby();
-		if (autoplay) {
+		if (wantsPlayback) {
+			if (this.android) this.androidStartTime = this.audio.currentTime;
 			// Unlike Navidrome, play() right away rather than waiting for `canplay`: a cold
 			// YouTube track takes seconds to arrive, and Android/iOS refuse to start audio
 			// from a background page that has been silent that long. `canplay` still retries.
@@ -1128,12 +1138,7 @@ class Player {
 			if (!song.karaokeOf) scrobble(song.id, false, song.coverArt);
 		}
 		this.persist();
-		this.prepareNextOffline();
-	}
-
-	/** The track `next()` would load when the current one ends. */
-	private upcoming(): Song | undefined {
-		return this.queue[this.index + 1] ?? (this.repeat === 'all' ? this.queue[0] : undefined);
+		this.prepareNext();
 	}
 
 	/**
@@ -1227,6 +1232,10 @@ class Player {
 		return (
 			!!this.standby &&
 			this.standbyFor === url &&
+			!this.standby.error &&
+			// Android may suppress preload with the screen locked. Keep using the
+			// active media element when the second one still has nothing to play.
+			(!this.android || !document.hidden || this.standby.readyState >= HAVE_FUTURE_DATA) &&
 			!this.retiring &&
 			this.standbyAllowed() &&
 			// Casting follows the element that started it; a swap would drop the session.
@@ -1239,7 +1248,7 @@ class Player {
 	 * when there is one, else its stream once `standbyStreamId` asks for it.
 	 */
 	private standbySource(): { id: string; url: string; kind: 'copy' | 'stream' } | null {
-		const next = this.upcoming();
+		const next = this.nextSong;
 		if (!next || next.id === this.current?.id) return null;
 		if (this.nextReady?.id === next.id) return { id: next.id, url: this.nextReady.copy.url, kind: 'copy' };
 		if (this.standbyStreamId === next.id) return { id: next.id, url: streamUrl(next.id), kind: 'stream' };
@@ -1252,8 +1261,8 @@ class Player {
 	 * next track changes. Waits while a handoff is still finishing on that element.
 	 */
 	private primeStandby() {
-		if (!this.standbyAllowed() || this.retiring || this.destroyed) return;
-		const source = this.standbySource();
+		if (this.retiring || this.destroyed) return;
+		const source = this.standbyAllowed() ? this.standbySource() : null;
 		const url = source?.url ?? null;
 		if (url === this.standbyFor) return;
 		// The next song changed (queue edit) while it was prerolling.
@@ -1283,10 +1292,11 @@ class Player {
 	 * with both streams for bandwidth.
 	 */
 	private standbyNextStream() {
-		const next = this.upcoming();
-		if (!this.standbyAllowed() || !next || next.id === this.current?.id) return;
+		const next = this.nextSong;
+		if (!this.standbyAllowed() || !next || this.preparation?.id !== next.id || this.preparation.lookup) return;
 		if (this.nextReady?.id === next.id || this.standbyStreamId === next.id) return;
 		this.standbyStreamId = next.id;
+		this.preparation.warm.abort();
 		if (this.blobJob?.id === next.id) {
 			logPlayback('blob-cancel', `id=${next.id} streaming on standby instead`);
 			this.blobJob.abort.abort();
@@ -1351,26 +1361,41 @@ class Player {
 		this.primeStandby();
 	}
 
-	private prepareNextOffline() {
-		const next = this.upcoming();
-		if (!next || next.id === this.current?.id || this.nextReady?.id === next.id) return;
-		void lookupOffline(next.id).then((copy) => {
-			if (this.destroyed || this.upcoming()?.id !== next.id) {
+	private clearPreparation() {
+		this.preparation?.warm.abort();
+		this.preparation = null;
+		this.blobJob?.abort.abort();
+		this.blobJob = null;
+		this.blobFailure = null;
+		this.cancelPreroll();
+		this.standbyStreamId = null;
+		const ready = this.nextReady;
+		this.nextReady = null;
+		this.primeStandby();
+		ready?.copy.revoke();
+	}
+
+	private prepareNext() {
+		const next = this.nextSong;
+		const id = next?.id !== this.current?.id ? next?.id : undefined;
+		if (this.preparation?.id === id) return;
+		this.clearPreparation();
+		if (!next || !id || this.switching || !this.audio.src || this.destroyed) return;
+		const lookup = lookupOffline(id);
+		const preparation: NextPreparation = { id, lookup, warm: new AbortController() };
+		this.preparation = preparation;
+		void lookup.then((copy) => {
+			if (!preparation.lookup) return; // load() owns the result
+			preparation.lookup = null;
+			if (this.preparation !== preparation) {
 				copy?.revoke();
 				return;
 			}
 			if (!copy) {
-				this.offlineMissFor = next.id;
-				// No downloaded copy: the server will have to resolve it. Start that now,
-				// while the current track is still playing and the page is not suspended.
-				void this.warmNext();
+				if (this.playRequested) this.prefetchInWindow();
+				if (!this.blobJob) void this.warmNext(next, preparation.warm.signal);
 				return;
 			}
-			if (this.nextReady?.id === next.id) {
-				copy.revoke();
-				return;
-			}
-			this.nextReady?.copy.revoke();
 			this.nextReady = { id: next.id, copy };
 			this.primeStandby();
 		});
@@ -1380,18 +1405,15 @@ class Player {
 	 * Ask the server for two bytes of the next track as soon as the current one starts.
 	 * A cold YouTube track can take over a minute to resolve on the server; doing it here,
 	 * while audio is playing and the page is still running, means the later whole-track
-	 * download or stream request is answered from the server's cache. Deliberately not
-	 * aborted on track change or by `load()`: finishing the resolve is the whole point.
+	 * download or stream request is answered from the server's cache.
 	 */
-	private async warmNext() {
-		const next = this.upcoming();
-		if (!next || next.id === this.current?.id) return;
-		if (this.nextReady?.id === next.id || this.warmed.has(next.id)) return;
-		this.warmed.add(next.id);
+	private async warmNext(next: Song, signal: AbortSignal) {
 		const started = performance.now();
 		logPlayback('warm-start', `id=${next.id}`);
 		try {
-			const res = await fetch(streamUrl(next.id), { headers: { Range: 'bytes=0-1' }, cache: 'no-store' });
+			const res = await fetch(streamUrl(next.id), { headers: { Range: 'bytes=0-1' }, cache: 'no-store', signal });
+			void res.body?.cancel();
+			if (signal.aborted) return;
 			if (res.ok) {
 				const suffix = suffixFromContentType(res.headers.get('content-type'));
 				if (suffix && next.suffix !== suffix) next.suffix = suffix;
@@ -1399,14 +1421,10 @@ class Player {
 				const rate = Number(res.headers.get('x-audio-sample-rate')) || undefined;
 				if (depth && next.bitDepth !== depth) next.bitDepth = depth;
 				if (rate && next.sampleRate !== rate) next.sampleRate = rate;
-				void res.body?.cancel();
 			}
 			logPlayback('warm-done', `id=${next.id} status=${res.status} ${Math.round(performance.now() - started)}ms`);
-			// A non-2xx answer did not resolve anything: allow another attempt.
-			if (!res.ok) this.warmed.delete(next.id);
 		} catch (e) {
-			// Allow a later retry (e.g. a proxy timeout cut the request short).
-			this.warmed.delete(next.id);
+			if (signal.aborted) return;
 			logPlayback('warm-failed', `id=${next.id} ${Math.round(performance.now() - started)}ms ${e instanceof Error ? e.message : String(e)}`);
 		}
 	}
@@ -1450,6 +1468,12 @@ class Player {
 		return 0;
 	}
 
+	private prefetchInWindow() {
+		const next = this.nextSong;
+		const duration = this.duration || this.current?.duration || 0;
+		if (next && duration > 0 && duration - this.time <= blobLeadFor(next.id)) void this.prefetchNextBlob();
+	}
+
 	/**
 	 * Download the whole next track into memory while the current one still plays,
 	 * so the `ended` handler can start it with no await and no network.
@@ -1458,16 +1482,10 @@ class Player {
 	 * for a flaky or slow server to recover before the track ends.
 	 */
 	private async prefetchNextBlob() {
-		const next = this.upcoming();
-		if (!next || next.id === this.current?.id) return;
+		const next = this.nextSong;
+		if (!next || this.preparation?.id !== next.id || this.preparation.lookup) return;
 		// Already streaming into the standby element: a download would only compete with it.
 		if (this.standbyStreamId === next.id) return;
-		// A copy for a track that is no longer next (the queue changed) is dead weight.
-		if (this.nextReady && this.nextReady.id !== next.id) {
-			this.nextReady.copy.revoke();
-			this.nextReady = null;
-			this.primeStandby();
-		}
 		if (this.nextReady?.id === next.id || this.blobJob?.id === next.id) return;
 
 		// If the current track is streaming over HTTP (not playing from a local blob/offline copy),
@@ -1490,7 +1508,7 @@ class Player {
 			return;
 		}
 
-		this.blobJob?.abort.abort();
+		this.preparation.warm.abort();
 		const job: BlobJob = { id: next.id, abort: new AbortController(), timedOut: false };
 		this.blobJob = job;
 		const timeout = setTimeout(() => {
@@ -1501,33 +1519,50 @@ class Player {
 		logPlayback('blob-start', `id=${next.id} "${next.title}" attempt=${attempt}`);
 		try {
 			const res = await fetch(streamUrl(next.id), { signal: job.abort.signal });
-			if (!res.ok) throw new Error(`HTTP ${res.status}`);
+			if (this.blobJob !== job) {
+				void res.body?.cancel();
+				return;
+			}
+			if (!res.ok) {
+				void res.body?.cancel();
+				throw new Error(`HTTP ${res.status}`);
+			}
+			// Some upstreams answer even an unrestricted GET with a partial range.
+			// Only a range covering the entire file can be promoted to a playable blob.
+			const range = res.headers.get('content-range');
+			const complete = range?.match(/^bytes 0-(\d+)\/(\d+)$/i);
+			if ((res.status === 206 || range) && (!complete || Number(complete[1]) + 1 !== Number(complete[2]))) {
+				void res.body?.cancel();
+				throw new Error('partial track');
+			}
 			const length = Number(res.headers.get('content-length') ?? 0);
-			if (length > MAX_BLOB_BYTES) {
+			const encoding = res.headers.get('content-encoding')?.trim().toLowerCase();
+			const expected = complete ? Number(complete[2]) : encoding && encoding !== 'identity' ? 0 : length;
+			if (Math.max(length, expected) > MAX_BLOB_BYTES) {
 				void res.body?.cancel();
 				this.blobFailure = { id: next.id, count: attempt, at: performance.now(), final: true };
 				logPlayback('blob-skipped', `id=${next.id} too large (${length} bytes), will stream`);
 				return;
 			}
 			const blob = await readCapped(res, MAX_BLOB_BYTES);
-			if (!blob) {
+			if (this.blobJob !== job) return;
+			if (job.timedOut) throw new Error('timeout');
+			if (!blob || blob.size > MAX_BLOB_BYTES) {
 				this.blobFailure = { id: next.id, count: attempt, at: performance.now(), final: true };
 				logPlayback('blob-skipped', `id=${next.id} too large (no length, > ${MAX_BLOB_BYTES} bytes), will stream`);
 				return;
 			}
-			if (this.destroyed || this.upcoming()?.id !== next.id) return;
 			if (blob.size < MIN_BLOB_BYTES) throw new Error(`too small (${blob.size} bytes)`);
-			// An offline copy could have landed while we downloaded.
-			if (this.nextReady?.id === next.id) return;
+			if (expected && blob.size !== expected) throw new Error(`incomplete track (${blob.size}/${expected} bytes)`);
 			const url = URL.createObjectURL(blob);
 			this.nextReady?.copy.revoke();
-			this.nextReady = { id: next.id, copy: { url, revoke: () => URL.revokeObjectURL(url) } };
+			this.nextReady = { id: next.id, copy: { url, revoke: () => URL.revokeObjectURL(url) }, prefetched: true };
 			this.primeStandby();
 			this.blobFailure = null;
 			logPlayback('blob-ready', `id=${next.id} bytes=${blob.size} type=${blob.type}`);
 		} catch (e) {
 			// Superseded by a newer job or by unload(): not a failure.
-			if (job.abort.signal.aborted && !job.timedOut) return;
+			if (this.blobJob !== job) return;
 			this.blobFailure = { id: next.id, count: attempt, at: performance.now(), final: false };
 			logPlayback(
 				'blob-failed',
@@ -1589,6 +1624,7 @@ class Player {
 			// Invalidate the watchdog now, including a callback iOS may hold and release
 			// on the next foreground.
 			this.disarmStallCheck();
+			if (this.playRequested && this.androidStartTime !== null) this.armStallCheck();
 			return;
 		}
 		this.output?.resume();
@@ -1703,6 +1739,7 @@ class Player {
 			this.lastProgressTime = a.currentTime;
 			this.lastProgressAt = performance.now();
 		}
+		if (this.androidStartTime !== null && a.currentTime !== this.androidStartTime) this.androidStartTime = null;
 		// It has played for a while: a later failure is a new incident and gets its own retry.
 		if (this.time > ERROR_REARM_AFTER_S) this.errorRetriedFor = null;
 		// Resync the lock-screen position once per 5 s slot. (A `% 5` check stays true
@@ -1712,8 +1749,7 @@ class Player {
 			this.lastPositionSlot = slot;
 			this.updatePosition();
 		}
-		const upcoming = this.upcoming();
-		if (dur > 0 && upcoming && dur - this.time <= blobLeadFor(upcoming.id)) void this.prefetchNextBlob();
+		this.prefetchInWindow();
 		// The real audio is over; don't sit through the silence up to the misread length.
 		// Switch straight to the next track without pausing: on a hidden iOS page a pause
 		// ends the audio session, and the next track then never gets past its metadata.
@@ -1723,7 +1759,7 @@ class Player {
 			this.onEnded();
 			return;
 		}
-		if (dur <= 0 || a.paused || this.repeat === 'one') return;
+		if (dur <= 0 || a.paused || this.repeat === 'one' || sleepTimer.isEndOfTrack) return;
 		const remaining = dur - this.time;
 		if (remaining <= STREAM_STANDBY_LEAD_S) this.standbyNextStream();
 		const source = this.standbySource();
@@ -1770,14 +1806,11 @@ class Player {
 	// times a minute for the whole session, screen off included). `onTime` keeps
 	// `lastProgressAt` fresh, so nothing has to be re-armed per timeupdate.
 	//
-	// The watchdog never runs while the page is hidden: it can't recover anything there
-	// (reloading a stream in the background aborts play() with an AbortError), and iOS
-	// may hold its timer and release it the instant the page is shown again, when "no
-	// progress for 15 s" is just the background time. It is disarmed on `hidden` and
-	// re-armed (with a fresh progress clock) when playback is resumed on `visible`.
+	// Only Android startup is watched while hidden. WebKit may hold a timer until
+	// the screen unlocks and refuses a background reload, so it recovers on visible.
 	private armStallCheck() {
 		this.lastProgressAt = performance.now();
-		if (document.hidden) return;
+		if (document.hidden && this.androidStartTime === null) return;
 		if (this.stallTimer === undefined) this.scheduleStallCheck(STALL_TIMEOUT_MS);
 	}
 
@@ -1799,15 +1832,19 @@ class Player {
 		if (gen !== this.stallGen) return;
 		this.stallTimer = undefined;
 		if (!this.playRequested || !this.current) return;
-		// Belt and braces: armed while visible but the page was hidden since.
 		if (document.hidden) {
-			this.resumeWhenVisible = true;
-			return;
+			if (this.androidStartTime === null) return;
+			// Screen-off timeupdate events can be throttled while native playback
+			// continues. Only a genuinely stationary incoming element needs a retry.
+			if (this.audio.currentTime !== this.androidStartTime || (this.audio.paused && !this.buffering)) {
+				this.androidStartTime = null;
+				return;
+			}
 		}
-		// Held by the OS and released late: no information about real progress. Start a
-		// fresh window instead of treating the held time as a stall.
+		// A late visible callback may have been held by the OS. During hidden Android
+		// startup the native clock check above already confirmed the source is still stuck.
 		const late = performance.now() - this.stallDueAt;
-		if (late > STALL_LATE_MS) {
+		if (!document.hidden && late > STALL_LATE_MS) {
 			logPlayback('stall-check-late', `${Math.round(late)}ms, ignored`);
 			this.lastProgressAt = performance.now();
 			return this.scheduleStallCheck(STALL_TIMEOUT_MS);
@@ -1823,7 +1860,7 @@ class Player {
 		// Still loading as far as the request goes: the `pause` handler keeps
 		// playRequested while buffering, so the retry below isn't cancelled.
 		this.buffering = true;
-		this.audio.pause();
+		if (!document.hidden) this.audio.pause();
 		logPlayback('stall-timeout', `t=${this.time.toFixed(1)} rs=${this.audio.readyState}`);
 		// Already handled for this load (onError would ignore it): never leave the
 		// spinner up with nothing re-armed; stop and show the error instead.
@@ -1847,8 +1884,11 @@ class Player {
 		this.errorHandledToken = this.loadToken;
 		logPlayback('media-error', `id=${song.id} code=${a.error?.code} ${a.error?.message ?? ''}`);
 		void this.probeSource(a.src);
-		// A prefetched blob that fails to play is bad: forget it so the retry uses the stream.
+		let retryStream = !a.src.startsWith('blob:');
 		if (this.playingOffline?.id === song.id && this.playingOffline.copy.url === a.src) {
+			// Re-fetch a failed network prefetch. An explicitly saved track can be
+			// reopened from its on-device copy.
+			retryStream = this.playingOffline.prefetched === true;
 			this.releaseOffline();
 		}
 		// If WebKit destroyed the element's hardware decoder (MEDIA_ERR_DECODE),
@@ -1860,14 +1900,14 @@ class Player {
 		}
 		if (this.playRequested && this.errorRetriedFor !== song.id) {
 			this.errorRetriedFor = song.id;
-			this.afterErrorDelay(() => this.load(this.index, true, this.time));
+			this.afterErrorDelay(() => this.load(this.index, true, this.time, retryStream ? 'stream-retry' : 'selected'));
 			return;
 		}
 		this.error = `Couldn't play “${song.title}”`;
-		if (this.playRequested && this.upcoming() && this.errorSkips < MAX_ERROR_SKIPS) {
+		if (this.playRequested && nextIndex(this.queue.length, this.index, this.repeat) >= 0 && this.errorSkips < MAX_ERROR_SKIPS) {
 			if (this.errorSkips === 0) this.errorOriginIndex = this.index;
 			this.errorSkips++;
-			this.afterErrorDelay(() => this.next());
+			this.afterErrorDelay(() => this.next(true));
 			return;
 		}
 		this.giveUp();
@@ -1887,6 +1927,7 @@ class Player {
 			setMediaMetadata(this.current);
 		}
 		this.errorOriginIndex = -1;
+		this.clearPreparation();
 		const wanted = this.playRequested;
 		// A failed element can still report "not paused": stop it so the button shows play.
 		this.pause();
@@ -1930,6 +1971,10 @@ class Player {
 	}
 
 	private onEnded() {
+		if (sleepTimer.onTrackEnded()) {
+			logPlayback('sleep-timer-stop');
+			return;
+		}
 		if (this.repeat === 'one') {
 			// A crossfade already under way would keep the next song playing unseen.
 			this.cancelPreroll();
@@ -1945,8 +1990,7 @@ class Player {
 			this.play();
 			return;
 		}
-		if (sleepTimer.onTrackEnded()) logPlayback('sleep-timer-stop');
-		else this.next();
+		this.next(true);
 	}
 
 	private updatePosition() {
@@ -1962,6 +2006,7 @@ class Player {
 	private unload() {
 		this.cancelPreroll();
 		this.loadToken++;
+		this.androidStartTime = null;
 		this.playRequested = false;
 		this.resumeWhenVisible = false;
 		this.buffering = false;
@@ -1971,14 +2016,8 @@ class Player {
 		this.disarmStallCheck();
 		clearTimeout(this.errorTimer);
 		this.errorOriginIndex = -1;
-		this.blobJob?.abort.abort();
-		this.blobJob = null;
-		this.blobFailure = null;
-		this.warmed.clear();
-		this.offlineMissFor = null;
+		this.clearPreparation();
 		this.releaseOffline();
-		this.nextReady?.copy.revoke();
-		this.nextReady = null;
 		this.retiring?.copy?.copy.revoke();
 		this.retiring?.listeners.abort();
 		this.retiring = null;

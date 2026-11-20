@@ -3,13 +3,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Song } from './types';
 
+type LocalCopy = { url: string; revoke: () => void };
+const getSession = vi.fn<() => { username: string } | null>();
+const getOffline = vi.fn<(_user: string, _id: string) => Promise<LocalCopy | null>>();
+vi.mock('./offline', () => ({ createOfflineTrackUrl: getOffline }));
 vi.mock('./api', () => ({
 	getPlayQueue: vi.fn(async () => null),
 	savePlayQueue: vi.fn(),
 	scrobble: vi.fn(),
 	streamUrl: (id: string) => `https://music.test/rest/stream?id=${id}`,
 	coverUrl: () => undefined,
-	getSession: () => null
+	getSession
 }));
 
 const sleepTimer = { onTrackEnded: vi.fn(() => false) };
@@ -90,6 +94,11 @@ const song = (id: string, duration = 200) => ({ id, title: id, duration }) as So
 const flush = () => new Promise((r) => setTimeout(r, 0));
 /** A response big enough to pass the prefetch's "not an error page" check. */
 const audioResponse = () => new Response(new Uint8Array(20_000));
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((done) => (resolve = done));
+	return { promise, resolve };
+}
 
 /** Play to `t` seconds on `audio`, as the element's clock would report it. */
 function playTo(audio: FakeAudio, t: number) {
@@ -102,11 +111,15 @@ async function freshPlayer() {
 	delete (globalThis as { __musicPlayer?: unknown }).__musicPlayer;
 	const { getPlayer } = await import('./player.svelte');
 	const player = getPlayer();
+	// Finish the constructor's preload before asking Vitest for the same dynamic mock.
+	if (getSession()) await vi.dynamicImportSettled();
 	return { player, audio: FakeAudio.last };
 }
 
 beforeEach(() => {
 	localStorage.clear();
+	getSession.mockReset().mockReturnValue(null);
+	getOffline.mockReset().mockResolvedValue(null);
 	FakeAudio.all = [];
 	vi.stubGlobal('Audio', FakeAudio);
 	// The player mounts its elements in the document; the fake is not a DOM node.
@@ -115,7 +128,7 @@ beforeEach(() => {
 	let n = 0;
 	URL.createObjectURL = vi.fn(() => `blob:test/${++n}`);
 	URL.revokeObjectURL = vi.fn();
-	sleepTimer.onTrackEnded.mockReturnValue(false);
+	sleepTimer.onTrackEnded.mockReset().mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -716,6 +729,208 @@ describe('Player background track changes', () => {
 		}
 	});
 
+	it('Android screen off: uses the active element if standby never buffered, even without a final timeupdate', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		try {
+			vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b')]);
+			await flush();
+			audio.ready(); // No timeupdate before ended.
+			await flush();
+			const standby = FakeAudio.all[1];
+			expect(standby.src).toMatch(/^blob:/);
+			expect(standby.readyState).toBe(0);
+			const copy = standby.src;
+			audio.fire('ended');
+			expect(audio.src).toBe(copy);
+			expect(standby.play).not.toHaveBeenCalled();
+			expect(standby.src).toBe('');
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it.each([true, false])('Android screen off (document.hidden=%s): starts an online successor while its local read is still pending', async (pageHidden) => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(pageHidden);
+		const pending = deferred<LocalCopy | null>();
+		getSession.mockReturnValue({ username: 'listener' });
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? pending.promise : null);
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b')]);
+			await vi.dynamicImportSettled();
+			expect(audio.src).toContain('id=a');
+			audio.fire('ended');
+			expect(audio.src).toContain('id=b');
+			const revoke = vi.fn();
+			pending.resolve({ url: 'blob:late', revoke });
+			await flush();
+			expect(revoke).toHaveBeenCalledOnce();
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it('Android: uses a local copy that finished preparing before the incoming track starts', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+		getSession.mockReturnValue({ username: 'listener' });
+		const revoke = vi.fn();
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? { url: 'blob:saved-b', revoke } : null);
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b')]);
+			await vi.dynamicImportSettled();
+			const standby = FakeAudio.all[1];
+			expect(standby.src).toBe('blob:saved-b');
+			standby.ready();
+			audio.fire('ended');
+			expect(standby.play).toHaveBeenCalledOnce();
+			expect(fetch).not.toHaveBeenCalled();
+			expect(revoke).not.toHaveBeenCalled();
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it('Android: waits for a pending offline copy when the device is offline at track end', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const online = vi.spyOn(navigator, 'onLine', 'get').mockReturnValue(false);
+		getSession.mockReturnValue({ username: 'listener' });
+		const local = deferred<LocalCopy | null>();
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? local.promise : null);
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b')]);
+			await vi.dynamicImportSettled();
+			audio.fire('ended');
+			expect(audio.src).toContain('id=a');
+			local.resolve({ url: 'blob:saved-b', revoke: vi.fn() });
+			await flush();
+			expect(audio.src).toBe('blob:saved-b');
+			expect(fetch).not.toHaveBeenCalled();
+		} finally {
+			online.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it('Android screen off: retries an incoming track with no data, and leaves advancing native playback alone', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b')]);
+			await vi.advanceTimersByTimeAsync(0);
+			audio.play.mockImplementationOnce(() => {
+				audio.paused = false;
+				audio.fire('waiting');
+				return new Promise(() => {});
+			});
+			audio.fire('ended');
+			expect(player.buffering).toBe(true);
+			audio.load.mockClear();
+			await vi.advanceTimersByTimeAsync(17_100);
+			expect(audio.load).toHaveBeenCalledTimes(1);
+			expect(audio.src).toContain('id=b');
+			audio.currentTime = 4; // Native playback is progressing without timeupdate.
+			await vi.advanceTimersByTimeAsync(35_000);
+			expect(audio.load).toHaveBeenCalledTimes(1);
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it('Android screen off: a throttled watchdog retries a stationary stream while its offline read is suspended', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		getSession.mockReturnValue({ username: 'listener' });
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? new Promise(() => {}) : null);
+		try {
+			const { player, audio } = await freshPlayer();
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+			const clock = performance.now.bind(performance);
+			let throttled = 0;
+			vi.spyOn(performance, 'now').mockImplementation(() => clock() + throttled);
+			player.playList([song('a'), song('b')]);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['a', 'b']);
+			audio.play.mockImplementationOnce(() => {
+				audio.paused = false;
+				audio.fire('waiting');
+				return new Promise(() => {});
+			});
+			audio.fire('ended');
+			expect(audio.src).toContain('id=b');
+			expect(player.buffering).toBe(true);
+			audio.load.mockClear();
+			// The OS held the startup watchdog well past its due time.
+			throttled = 45_000;
+			await vi.advanceTimersByTimeAsync(17_100);
+			expect(audio.load).toHaveBeenCalledTimes(1);
+			expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['a', 'b']);
+			audio.currentTime = 2;
+			throttled += 45_000;
+			await vi.advanceTimersByTimeAsync(17_100);
+			expect(audio.load).toHaveBeenCalledTimes(1);
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
+	it.each([
+		{ source: 'prefetched', pageHidden: true },
+		{ source: 'saved', pageHidden: true },
+		{ source: 'prefetched', pageHidden: false }
+	])('Android screen off (document.hidden=$pageHidden): retries a failed $source blob from its original source', async ({ source, pageHidden }) => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(pageHidden);
+		getSession.mockReturnValue({ username: 'listener' });
+		getOffline.mockImplementation(async (_user, id) =>
+			source === 'saved' && id === 'b' ? { url: 'blob:saved-b', revoke: vi.fn() } : null
+		);
+		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
+		try {
+			const { player, audio } = await freshPlayer();
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+			player.playList([song('a'), song('b')]);
+			await vi.advanceTimersByTimeAsync(0);
+			audio.ready();
+			await vi.advanceTimersByTimeAsync(0);
+			audio.fire('ended');
+			const incoming = FakeAudio.all.find((el) => el.src.startsWith('blob:') && !el.paused)!;
+			expect(incoming.src).toMatch(source === 'saved' ? /^blob:saved-b$/ : /^blob:test\//);
+			getOffline.mockClear();
+			getOffline.mockImplementation(async () => source === 'saved'
+				? { url: 'blob:reopened-b', revoke: vi.fn() }
+				: new Promise(() => {}));
+			incoming.fire('error');
+			await vi.advanceTimersByTimeAsync(2_100);
+			if (source === 'saved') {
+				expect(getOffline).toHaveBeenCalledWith('listener', 'b');
+				expect(incoming.src).toBe('blob:reopened-b');
+			} else {
+				expect(getOffline).not.toHaveBeenCalled();
+				expect(incoming.src).toContain('id=b');
+			}
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
 	it('Android: streams the next track on standby when its download is too slow', async () => {
 		let signal: AbortSignal | undefined;
 		vi.stubGlobal(
@@ -828,6 +1043,37 @@ describe('Player background track changes', () => {
 });
 
 describe('Player media errors', () => {
+	it('Android: advances past a failed retry while the following track’s offline lookup is suspended and the page reports visible', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+		getSession.mockReturnValue({ username: 'listener' });
+		const local = deferred<LocalCopy | null>();
+		getOffline.mockImplementation(async (_user, id) => id === 'c' ? local.promise : null);
+		try {
+			const { player, audio } = await freshPlayer();
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
+			player.playList([song('a'), song('b'), song('c')], 1);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['b', 'c']);
+			audio.fire('error');
+			await vi.advanceTimersByTimeAsync(2_000);
+			expect(audio.src).toContain('id=b');
+			audio.fire('error');
+			await vi.advanceTimersByTimeAsync(2_000);
+			expect(player.current?.id).toBe('c');
+			expect(audio.src).toContain('id=c');
+			expect(audio.paused).toBe(false);
+			const revoke = vi.fn();
+			local.resolve({ url: 'blob:late-c', revoke });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(revoke).toHaveBeenCalledOnce();
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+			vi.useRealTimers();
+		}
+	});
+
 	it('reloads a failed track once, then skips to the next', async () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
 		try {
@@ -882,6 +1128,187 @@ describe('Player unload', () => {
 });
 
 describe('Player queue edits', () => {
+	it('starts looking up a newly appended successor once and discards an obsolete local result', async () => {
+		getSession.mockReturnValue({ username: 'listener' });
+		const b = deferred<LocalCopy | null>();
+		const d = deferred<LocalCopy | null>();
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? b.promise : id === 'd' ? d.promise : null);
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a')]);
+		await vi.dynamicImportSettled();
+		player.addToQueue([song('b')]);
+		player.addToQueue([song('c')]);
+		audio.ready();
+		playTo(audio, 180);
+		await vi.dynamicImportSettled();
+		expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['a', 'b']);
+		expect(fetch).not.toHaveBeenCalled();
+		player.playNext([song('d')]);
+		await vi.dynamicImportSettled();
+		d.resolve({ url: 'blob:offline-d', revoke: vi.fn() });
+		await flush();
+		const revokeB = vi.fn();
+		b.resolve({ url: 'blob:offline-b', revoke: revokeB });
+		await flush();
+		expect(revokeB).toHaveBeenCalledOnce();
+		const standby = FakeAudio.all[1];
+		expect(standby.src).toBe('blob:offline-d');
+		expect(fetch).not.toHaveBeenCalled();
+		audio.fire('ended');
+		expect(player.current?.id).toBe('d');
+		expect(standby.play).toHaveBeenCalledOnce();
+	});
+
+	it('reuses a pending offline lookup when its track is selected', async () => {
+		getSession.mockReturnValue({ username: 'listener' });
+		const pending = deferred<LocalCopy | null>();
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? pending.promise : null);
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await vi.dynamicImportSettled();
+		expect(audio.src).toContain('id=a');
+		player.next();
+		const revoke = vi.fn();
+		pending.resolve({ url: 'blob:saved-b', revoke });
+		await flush();
+		expect(audio.src).toBe('blob:saved-b');
+		expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['a', 'b']);
+		expect(revoke).not.toHaveBeenCalled();
+	});
+
+	it('honours a pause while the selected track is waiting for its local copy', async () => {
+		getSession.mockReturnValue({ username: 'listener' });
+		const pending = deferred<LocalCopy | null>();
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? pending.promise : null);
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await vi.dynamicImportSettled();
+		player.next();
+		player.pause();
+		audio.play.mockClear();
+		pending.resolve({ url: 'blob:saved-b', revoke: vi.fn() });
+		await flush();
+		audio.ready();
+		expect(audio.src).toBe('blob:saved-b');
+		expect(audio.autoplay).toBe(false);
+		expect(audio.play).not.toHaveBeenCalled();
+		expect(player.active).toBe(false);
+	});
+
+	it('aborts previous work on queue edits and does not reuse an obsolete completion for the same ID', async () => {
+		const requests: Array<{ id: string; signal: AbortSignal; result: ReturnType<typeof deferred<Response>> }> = [];
+		vi.stubGlobal('fetch', vi.fn((url: string, init: RequestInit) => {
+			const result = deferred<Response>();
+			requests.push({ id: new URL(url).searchParams.get('id')!, signal: init.signal!, result });
+			return result.promise;
+		}));
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		expect(requests[0].signal.aborted).toBe(false);
+		audio.ready();
+		expect(requests[0].signal.aborted).toBe(true);
+		const first = requests[1];
+		player.addToQueue([song('c')]);
+		expect(requests).toHaveLength(2);
+		player.removeAt(1);
+		expect(first.signal.aborted).toBe(true);
+		await flush();
+		player.playNext([song('b')]);
+		await flush();
+		expect(requests.map(({ id }) => id)).toEqual(['b', 'b', 'c', 'b']);
+		expect(requests[2].signal.aborted).toBe(true);
+		first.result.resolve(audioResponse());
+		await flush();
+		expect(URL.createObjectURL).not.toHaveBeenCalled();
+		requests[3].result.resolve(audioResponse());
+		await flush();
+		const url = FakeAudio.all[1].src;
+		expect(url).toMatch(/^blob:/);
+		player.clearUpNext();
+		expect(FakeAudio.all[1].src).toBe('');
+		expect(URL.revokeObjectURL).toHaveBeenCalledWith(url);
+	});
+
+	it.each<ResponseInit>([
+		{ status: 206, headers: { 'content-range': 'bytes 0-19999/80000' } },
+		{ status: 200, headers: { 'content-length': '80000' } },
+		{ status: 200, headers: { 'content-length': '80000', 'content-encoding': 'identity' } }
+	])('streams instead of promoting an incomplete $status response', async (init) => {
+		vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array(20_000), init)));
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.ready();
+		await flush();
+		expect(URL.createObjectURL).not.toHaveBeenCalled();
+		playTo(audio, 175);
+		expect(FakeAudio.all[1].src).toContain('id=b');
+	});
+
+	it('repeat one releases standby, avoids speculative requests and lets the sleep timer stop playback', async () => {
+		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.ready();
+		await flush();
+		const standby = FakeAudio.all[1];
+		const url = standby.src;
+		player.cycleRepeat();
+		player.cycleRepeat();
+		expect(standby.src).toBe('');
+		expect(URL.revokeObjectURL).toHaveBeenCalledWith(url);
+		vi.mocked(fetch).mockClear();
+		playTo(audio, 199.8);
+		expect(fetch).not.toHaveBeenCalled();
+		sleepTimer.onTrackEnded.mockReturnValueOnce(true);
+		audio.play.mockClear();
+		audio.fire('ended');
+		expect(sleepTimer.onTrackEnded).toHaveBeenCalledOnce();
+		expect(audio.play).not.toHaveBeenCalled();
+		expect(player.current?.id).toBe('a');
+	});
+
+	it('immediately stops an audible crossfade when its successor is removed', async () => {
+		const resetFade = vi.fn();
+		vi.doMock('./playback/webAudioOutput', () => ({
+			WebAudioOutput: class {
+				attach() {}
+				setVolume() {}
+				setTrim() {}
+				quickFadeIn() {}
+				silenceFade() {}
+				crossfade() {}
+				resetFade = resetFade;
+				trackChanged() {}
+				resume() {}
+				dispose() {}
+			}
+		}));
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio', crossfade: true }));
+		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('b'), song('c')]);
+			await flush();
+			audio.ready();
+			await flush();
+			playTo(audio, 194);
+			const standby = FakeAudio.all[1];
+			standby.fire('playing');
+			expect(player.crossfading).toBe(true);
+			player.removeAt(1);
+			expect(player.crossfading).toBe(false);
+			expect(standby.paused).toBe(true);
+			expect(standby.src).toBe('');
+			expect(resetFade).toHaveBeenCalledWith(audio);
+			expect(player.current?.id).toBe('a');
+		} finally {
+			vi.doUnmock('./playback/webAudioOutput');
+		}
+	});
+
 	it('keeps the current song when removing and moving others', async () => {
 		const { player } = await freshPlayer();
 		player.playList([song('a'), song('b'), song('c'), song('d')], 2);

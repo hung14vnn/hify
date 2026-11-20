@@ -611,11 +611,7 @@ def _playlist_json(row: dict[str, Any], entries: list[dict[str, Any]]) -> dict[s
 @router.get("/getPlaylists")
 async def get_playlists(request: Request, user=Depends(current_user)) -> JSONResponse:
     rows = await db.playlists_for(user["user_id"])
-    playlists = []
-    for row in rows:
-        full = await db.playlist(row["id"], user["user_id"])
-        if full:
-            playlists.append(_playlist_json(full, full.get("entry") or []))
+    playlists = [_playlist_json(row, row["entry"]) for row in rows]
     return _ok(playlists={"playlist": playlists})
 
 

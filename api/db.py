@@ -272,37 +272,26 @@ def _create_playlist(user: dict[str, Any], name: str, song_ids: list[str]) -> st
             " VALUES (?, ?, ?, '', ?, 1, ?, ?)",
             (playlist_id, user["user_id"], name, user["username"], now, now),
         )
+        if song_ids:
+            _append_items(conn, playlist_id, song_ids, 0)
         conn.commit()
-    if song_ids:
-        _append_items(playlist_id, song_ids)
     return playlist_id
 
 
-def _append_items(playlist_id: str, song_ids: list[str], payloads: dict[str, dict] | None = None) -> None:
-    from providers.meta import get_song, remember
+def _append_items(
+    conn: sqlite3.Connection, playlist_id: str, song_ids: list[str], position: int
+) -> None:
+    from providers.meta import get_song
 
-    payloads = payloads or {}
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT COALESCE(MAX(position), -1) AS p FROM playlist_items WHERE playlist_id = ?",
-            (playlist_id,),
-        ).fetchone()
-        position = int(row["p"] or -1) + 1
-        for song_id in song_ids:
-            payload = payloads.get(song_id) or get_song(song_id)
-            if not payload:
-                continue
-            remember(payload)
-            conn.execute(
-                "INSERT OR REPLACE INTO playlist_items (playlist_id, position, track_id, payload)"
-                " VALUES (?, ?, ?, ?)",
-                (playlist_id, position, song_id, json.dumps(payload, ensure_ascii=False)),
-            )
-            position += 1
+    for song_id in song_ids:
+        payload = get_song(song_id)
+        if not payload:
+            continue
         conn.execute(
-            "UPDATE playlists SET updated_at = ? WHERE id = ?", (int(time.time()), playlist_id)
+            "INSERT INTO playlist_items (playlist_id, position, track_id, payload) VALUES (?, ?, ?, ?)",
+            (playlist_id, position, song_id, json.dumps(payload, ensure_ascii=False)),
         )
-        conn.commit()
+        position += 1
 
 
 async def create_playlist(user: dict[str, Any], name: str, song_ids: list[str]) -> str:
@@ -311,10 +300,22 @@ async def create_playlist(user: dict[str, Any], name: str, song_ids: list[str]) 
 
 def _playlists_for(user_id: str) -> list[dict[str, Any]]:
     with _connect() as conn:
+        # Keep metadata and entries in the same snapshot during concurrent edits.
+        conn.execute("BEGIN")
         rows = conn.execute(
             "SELECT * FROM playlists WHERE user_id = ? ORDER BY updated_at DESC", (user_id,)
-        ).fetchall()
-    return [dict(row) for row in rows]
+        )
+        playlists = {row["id"]: dict(row, entry=[]) for row in rows}
+        if playlists:
+            items = conn.execute(
+                "SELECT playlist_id, payload FROM playlist_items"
+                " WHERE playlist_id IN (SELECT id FROM playlists WHERE user_id = ?)"
+                " ORDER BY playlist_id, position",
+                (user_id,),
+            )
+            for item in items:
+                playlists[item["playlist_id"]]["entry"].append(json.loads(item["payload"]))
+    return list(playlists.values())
 
 
 async def playlists_for(user_id: str) -> list[dict[str, Any]]:
@@ -353,46 +354,37 @@ def _update_playlist(
     add_ids: list[str],
     remove_indexes: list[int],
 ) -> None:
-    from providers.meta import get_song
-
     with _connect() as conn:
-        row = _playlist_row(conn, playlist_id)
-        if row is None or row["user_id"] != user_id:
+        updated = conn.execute(
+            "UPDATE playlists SET updated_at = ?, name = COALESCE(?, name),"
+            " comment = COALESCE(?, comment), public = COALESCE(?, public)"
+            " WHERE id = ? AND user_id = ?",
+            (int(time.time()), name, comment, public, playlist_id, user_id),
+        )
+        if not updated.rowcount:
             return
-        items = [
-            dict(item)
-            for item in conn.execute(
+        if remove_indexes:
+            removed = set(remove_indexes)
+            items = conn.execute(
                 "SELECT track_id, payload FROM playlist_items WHERE playlist_id = ? ORDER BY position",
                 (playlist_id,),
-            ).fetchall()
-        ]
-        for index in sorted(set(remove_indexes), reverse=True):
-            if 0 <= index < len(items):
-                items.pop(index)
-        for song_id in add_ids:
-            payload = get_song(song_id)
-            if payload:
-                items.append({"track_id": song_id, "payload": json.dumps(payload, ensure_ascii=False)})
-        conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
-        for position, item in enumerate(items):
-            conn.execute(
+            )
+            remaining = [item for index, item in enumerate(items) if index not in removed]
+            conn.execute("DELETE FROM playlist_items WHERE playlist_id = ?", (playlist_id,))
+            conn.executemany(
                 "INSERT INTO playlist_items (playlist_id, position, track_id, payload)"
                 " VALUES (?, ?, ?, ?)",
-                (playlist_id, position, item["track_id"], item["payload"]),
+                (
+                    (playlist_id, position, item["track_id"], item["payload"])
+                    for position, item in enumerate(remaining)
+                ),
             )
-        sets = ["updated_at = ?"]
-        values: list[Any] = [int(time.time())]
-        if name is not None:
-            sets.append("name = ?")
-            values.append(name)
-        if comment is not None:
-            sets.append("comment = ?")
-            values.append(comment)
-        if public is not None:
-            sets.append("public = ?")
-            values.append(1 if public else 0)
-        values.append(playlist_id)
-        conn.execute(f"UPDATE playlists SET {', '.join(sets)} WHERE id = ?", values)
+        if add_ids:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            ).fetchone()[0]
+            _append_items(conn, playlist_id, add_ids, position)
         conn.commit()
 
 
