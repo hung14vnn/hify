@@ -420,6 +420,24 @@ export function streamUrl(id: string, bust?: number, timeOffset?: number, format
 	return buildUrl(session, 'stream', params);
 }
 
+/**
+ * Ask the server to resolve a track's stream without playing it. Two bytes are
+ * enough: the backend caches the resolved URL, so a later Play starts instantly.
+ * Fire this as soon as a track is about to be shown/hovered, not on Play.
+ */
+export async function warmTrack(id: string, signal?: AbortSignal): Promise<Response | null> {
+	if (!session || !id) return null;
+	const res = await fetch(streamUrl(id), {
+		headers: { Range: 'bytes=0-1' },
+		cache: 'no-store',
+		signal
+	}).catch(() => null);
+	// Headers are all we need. A DASH track answers 200 with a piped whole-file
+	// body; leaving it open would download ~40 MB per probe.
+	if (res) void res.body?.cancel();
+	return res;
+}
+
 export function downloadUrl(id: string, lossless = false, format?: string) {
 	if (!session) return '';
 	const params: Record<string, string | number | boolean> = { id };
@@ -797,7 +815,7 @@ export async function getPlaybackQuality(): Promise<PlaybackQuality> {
 	const res = await fetch(qualityEndpoint());
 	if (!res.ok) throw new Error('Couldn’t read playback quality');
 	const data = (await res.json()) as { quality?: PlaybackQuality };
-	return data.quality ?? 'HI_RES_LOSSLESS';
+	return data.quality ?? 'LOSSLESS';
 }
 
 export async function setPlaybackQuality(value: PlaybackQuality): Promise<PlaybackQuality> {

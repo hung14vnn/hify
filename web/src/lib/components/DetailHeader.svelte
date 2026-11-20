@@ -3,7 +3,7 @@
 	// On phones, passing `songs` switches to the full-bleed Apple Music hero (shuffle · Play ·
 	// download over the artwork); desktop always uses the `actions` snippet.
 	import type { Snippet } from 'svelte';
-	import { getSession } from '../api';
+	import { getSession, warmTrack } from '../api';
 	import { downloadAll } from '../menus';
 	import { listOfflineTrackMetadata } from '../offline';
 	import { artworkTint } from '../palette';
@@ -50,6 +50,17 @@
 	let offline = $state(new Set<string>());
 	let downloading = $state(false);
 	const allOffline = $derived(!!songs?.length && songs.every((s) => offline.has(s.id)));
+
+	// The header's Play button is the most likely next action. Resolving the first
+	// track here (while the user is still looking at the page) hides the ~1.5 s
+	// cold add-on round trip behind browsing instead of behind the play press.
+	const warmed = new Set<string>();
+	$effect(() => {
+		const first = songs?.[0];
+		if (!first || warmed.has(first.id)) return;
+		warmed.add(first.id);
+		void warmTrack(first.id);
+	});
 
 	async function refreshOffline() {
 		const user = getSession()?.username;

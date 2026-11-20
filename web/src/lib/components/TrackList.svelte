@@ -3,6 +3,9 @@
 	// left open during playback doesn't keep animating rows nobody can see.
 	// One observer is shared by every bars element on the page.
 	let observer: IntersectionObserver | undefined;
+	// Shared by every list on the page: hovering the same row twice must not
+	// start two identical 2-byte probes.
+	const warmed = new Set<string>();
 
 	function pauseOffscreen(node: HTMLElement) {
 		observer ??= new IntersectionObserver((entries) => {
@@ -14,6 +17,7 @@
 </script>
 
 <script lang="ts">
+	import { warmTrack } from '../api';
 	import { artistName, time } from '../format';
 	import { songMenu } from '../menus';
 	import { getPlayer } from '../player.svelte';
@@ -82,6 +86,19 @@
 		ui.openMenu(e, songMenu(song, extraMenu?.(song, i) ?? []));
 	}
 
+	/** Hover/focus is early enough to hide the cold add-on lookup behind the click. */
+	let warmTimer: ReturnType<typeof setTimeout> | undefined;
+	function warm(id: string) {
+		if (warmed.has(id)) return;
+		// A row the pointer merely passes through should not cost an add-on call.
+		clearTimeout(warmTimer);
+		warmTimer = setTimeout(() => {
+			if (warmed.has(id)) return;
+			warmed.add(id);
+			void warmTrack(id);
+		}, 180);
+	}
+
 	const HOLD_MS = 500;
 	let holdTimer: ReturnType<typeof setTimeout> | undefined;
 	let holdFrom: { x: number; y: number } | null = null;
@@ -143,6 +160,8 @@
 			class="row"
 			class:current
 			role="listitem"
+			onpointerenter={() => warm(song.id)}
+			onfocus={() => warm(song.id)}
 			ondblclick={selectionMode ? undefined : () => play(i)}
 			oncontextmenu={(e) => {
 				// While a hold is in progress the browser's own long-press menu must not appear.

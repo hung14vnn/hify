@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS lastfm_connections (
 
 CREATE TABLE IF NOT EXISTS user_prefs (
     user_id TEXT PRIMARY KEY,
-    quality TEXT NOT NULL DEFAULT 'HI_RES_LOSSLESS'
+    quality TEXT NOT NULL DEFAULT 'LOSSLESS'
 );
 
 CREATE TABLE IF NOT EXISTS legacy_users (
@@ -143,6 +143,14 @@ def init_db() -> None:
     settings.music_db_path.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        # One-time migration: the old default was HI_RES_LOSSLESS. Anyone still on
+        # that value never actively chose it, so move them to the new LOSSLESS
+        # default; explicit choices (HIGH/LOW/LOSSLESS) are left alone.
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            conn.execute(
+                "UPDATE user_prefs SET quality = 'LOSSLESS' WHERE quality = 'HI_RES_LOSSLESS'"
+            )
+            conn.execute("PRAGMA user_version = 1")
         conn.commit()
 
 
@@ -565,7 +573,7 @@ async def lastfm_usernames() -> set[str]:
 
 # --- playback quality -------------------------------------------------------
 
-DEFAULT_QUALITY = "HI_RES_LOSSLESS"
+DEFAULT_QUALITY = "LOSSLESS"
 # HI_RES_LOSSLESS / LOSSLESS / HIGH are asked of the lossless (Eclipse) source, which
 # has its own HIGH (AAC); LOW skips that source and streams YouTube through yt-dlp.
 QUALITY_VALUES = ("HI_RES_LOSSLESS", "LOSSLESS", "HIGH", "LOW")

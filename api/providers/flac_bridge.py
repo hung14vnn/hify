@@ -24,7 +24,11 @@ logger = logging.getLogger("music")
 _MANIFEST_TTL = 10 * 60.0
 _MANIFEST_ERROR_TTL = 10.0
 _RESOLVE_TTL = 30 * 60.0
-_URL_TTL = 10 * 60.0
+# Signed stream URLs from the add-on live ~1h. 30 min is the fallback when the
+# response has no `expiresAt`; when it does, we trust it (minus the buffer below)
+# so a replay inside the hour skips the slow /stream/<id> round trip (~2 s here).
+_URL_TTL = 30 * 60.0
+_URL_EXPIRY_BUFFER_S = 5 * 60.0
 
 
 @dataclass(slots=True)
@@ -147,12 +151,17 @@ class FlacBridge:
             return None
 
     async def warm_manifests(self) -> None:
-        """Prefetch manifests for configured add-ons in background."""
+        """Prefetch manifests and access tokens for configured add-ons in background.
+
+        The access token is required by every add-on call and costs a round trip
+        on a cold start; grabbing it here removes that latency from the first play.
+        """
         for base in self._addons:
             try:
                 m = await self._manifest(base)
                 if m:
                     logger.info("flac_bridge: warmed manifest for %s (id=%s)", base, m.get("id"))
+                    await self._get_access_token(m.get("id"))
             except Exception as exc:
                 logger.warning("flac_bridge: warm manifest failed for %s: %s", base, exc)
 
@@ -296,7 +305,9 @@ class FlacBridge:
                 if expiry_s < 1e12:
                     expiry_s *= 1000
                 remaining = (expiry_s - time.time() * 1000) / 1000
-                expires = min(expires, time.monotonic() + max(remaining - 5, 0))
+                # Trust the add-on's expiry (the old min() with a 10 min default
+                # threw away ~50 min of useful cache on every signed URL).
+                expires = time.monotonic() + max(remaining - _URL_EXPIRY_BUFFER_S, 0)
             except (TypeError, ValueError):
                 pass
         result = FlacStream(

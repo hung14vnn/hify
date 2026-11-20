@@ -51,7 +51,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"tracks": []})
             return
         if parts.path == "/stream/t1":
-            quality = (query.get("quality") or ["HI_RES_LOSSLESS"])[0].upper()
+            quality = (query.get("quality") or ["LOSSLESS"])[0].upper()
             if quality in {"HIGH", "LOW"}:
                 self._json(
                     {

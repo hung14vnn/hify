@@ -51,29 +51,32 @@
 	let incomingDisplay = $state<DisplayTrack | null>(null);
 	let incomingActive = $state(false);
 
+	let tint: Tint | null = $state(null);
 	let nextTint: Tint | null = $state(null);
 	let npHeight = $state(0);
 	let controlsVisible = $state(true);
+	/** Set by close(): the backdrop must not fade out underneath the morph. */
+	let closing = false;
 	let controlsTimer: ReturnType<typeof setTimeout> | undefined;
 	let wakeLock: WakeLockSentinel | null = null;
 
 	$effect(() => {
-		const display = currentDisplay;
-		if (!display) return;
+		const art = song?.coverArt;
 		let cancelled = false;
-		const result = artworkTint(display.coverArt);
-		if (result instanceof Promise) {
-			result.then((t) => { if (!cancelled) display.tint = t; });
-		} else {
-			display.tint = result;
-		}
+		Promise.resolve(artworkTint(art)).then((t) => {
+			if (!cancelled) {
+				tint = t;
+				if (currentDisplay && currentDisplay.id === song?.id) {
+					currentDisplay.tint = t;
+				}
+			}
+		});
 		return () => (cancelled = true);
 	});
 
 	$effect(() => {
 		const art = nextSong?.coverArt;
 		let cancelled = false;
-		nextTint = null;
 		if (art) {
 			Promise.resolve(artworkTint(art)).then((t) => {
 				if (!cancelled) {
@@ -83,6 +86,8 @@
 					}
 				}
 			});
+		} else {
+			nextTint = null;
 		}
 		return () => (cancelled = true);
 	});
@@ -110,12 +115,11 @@
 					title: cur.title,
 					artist: cur.artist,
 					album: cur.album,
-					tint: null
+					tint
 				};
 			}
-		} else if (currentDisplay.coverArt !== cur.coverArt) {
+		} else if (currentDisplay.id === cur.id && !currentDisplay.coverArt && cur.coverArt) {
 			currentDisplay.coverArt = cur.coverArt;
-			currentDisplay.tint = null;
 		}
 	});
 
@@ -150,6 +154,12 @@
 			}
 		}
 	});
+
+	const displayTint = $derived(
+		incomingActive && incomingDisplay?.tint
+			? incomingDisplay.tint
+			: currentDisplay?.tint ?? tint
+	);
 
 	const LOSSLESS = new Set([
 		"flac",
@@ -588,8 +598,7 @@
 
 	// Swipe-down-to-dismiss from anywhere in the Now Playing screen.
 	let startY = 0;
-	let dragY = 0;
-	let dragReturn: Animation | undefined;
+	let dragY = $state(0);
 	let dismissGesture = false;
 
 	function onTouchStart(e: TouchEvent) {
@@ -598,42 +607,26 @@
 		dismissGesture = !(
 			e.target instanceof Element && e.target.closest(".panel, .slider")
 		);
-		if (!dismissGesture) return;
-		const node = e.currentTarget as HTMLElement;
-		if (dragReturn?.playState === "running") {
-			dragY = node.getBoundingClientRect().top;
-			node.style.translate = `0 ${dragY}px`;
-			dragReturn.cancel();
-		}
-		startY = e.touches[0].clientY - dragY;
+		if (dismissGesture) startY = e.touches[0].clientY;
 	}
 
 	function onTouchMove(e: TouchEvent) {
-		if (!dismissGesture) return;
-		dragY = Math.max(0, e.touches[0].clientY - startY);
-		(e.currentTarget as HTMLElement).style.translate = `0 ${dragY}px`;
+		if (dismissGesture) dragY = Math.max(0, e.touches[0].clientY - startY);
 	}
 
-	function settleDrag(node: HTMLElement, duration: number) {
-		if (!dragY) return;
-		if (duration && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
-			dragReturn = node.animate([{ translate: `0 ${dragY}px` }, { translate: "0 0" }], {
-				duration, easing: MORPH_EASE
-			});
-		}
-		node.style.translate = "";
-		dragY = 0;
-	}
-
-	function onTouchEnd(e: TouchEvent) {
-		if (!dismissGesture) return;
+	function onTouchEnd() {
+		if (dismissGesture) dragY > 110 ? close() : (dragY = 0);
 		dismissGesture = false;
-		if (e.type === "touchend" && dragY > 110) close();
-		else settleDrag(e.currentTarget as HTMLElement, 240);
 	}
 
 	function close() {
+		closing = true;
 		ui.closeNowPlaying();
+	}
+
+	/** The backdrop fades between tracks, but never while the sheet closes. */
+	function backdropOut(node: Element, opts?: { duration?: number }) {
+		return fadeOnly(node, { duration: closing ? 0 : (opts?.duration ?? 450) });
 	}
 
 	// ---- open/close morph ------------------------------------------------------
@@ -646,20 +639,10 @@
 	// clip-path, so a busy main thread while the sheet mounts can't stall it.
 	// The curve is gentler than the dock's so the pill visibly grows instead of
 	// jumping most of the way in the first frames.
-	const MORPH_EASE = "cubic-bezier(0.32, 0, 0.26, 1)";
+	const MORPH_EASE = "cubic-bezier(0.3, 0.7, 0.2, 1)";
 	// Title/artist are not in this list: they fly from the mini player instead.
 	const MORPH_FADE =
-		".grab, .info .round, .progress, .transport .skip:first-child, .volume, .bottom, .panel, .panel-veil.visible, .nothing, .art-row.mini .meta-btn";
-	// Clear the path before the title reaches the progress slider and its labels.
-	// Offsets follow the same eased position as the artwork and text.
-	function dismissFade(progress = 1, opacity = 1): Keyframe[] {
-		return [
-			{ offset: 0, opacity: 0 },
-			{ offset: Math.max(0, progress - 0.07), opacity: 0 },
-			{ offset: progress, opacity },
-			{ offset: 1, opacity: 1 },
-		];
-	}
+		".grab, .info .round, .progress, .transport .skip:first-child, .volume, .bottom, .panel, .nothing, .art-row.mini .meta-btn";
 	// Mini player text → its Now Playing counterpart (full layout, or compact
 	// row when a panel is open on mobile).
 	// Mini player buttons → their Now Playing counterparts.
@@ -672,10 +655,10 @@
 		{ from: "[data-np-artist]", to: ".info .artist, .art-row.mini .c-artist" },
 	];
 	let morphAnims: Animation[] = [];
-	function clearMorph() {
-		for (const animation of morphAnims) animation.cancel();
-		morphAnims = [];
-	}
+	/** Direction the current animations' keyframes were built for. */
+	let morphBuiltFor: "in" | "out" = "in";
+	/** Direction the sheet is heading now (changes when reversed mid-flight). */
+	let morphDir: "in" | "out" = "in";
 
 	// Returns a deferred config: Svelte calls it on every start *and* reversal with
 	// the current direction, so open↔close interruptions can be handled here.
@@ -683,91 +666,90 @@
 		// (Svelte's types declare no argument, but the runtime passes `{ direction }`.)
 		return (opts?: { direction?: "in" | "out" }): TransitionConfig => {
 			const dir = opts?.direction === "out" ? "out" : "in";
-			const duration = dir === "out" ? 360 : 460;
-			const rate = dir === "out" ? -1 : 1;
-			const box = node.getBoundingClientRect();
-			settleDrag(node, duration);
-			if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
-				clearMorph();
-				return { duration: 0 };
-			}
+			const duration = dir === "out" ? 480 : 620;
+			morphDir = dir;
+			// The outward morph must not keep the tinted sheet over the pill: switch
+			// the sheet to the mini player's default colour from its first frame.
+			if (dir === "out") node.classList.add("closing");
 
 			// Reversed mid-flight: turn the running animations around so they continue
 			// from where they are and land when Svelte's (shortened) timer does.
 			if (morphAnims.some((a) => a.playState === "running")) {
 				for (const a of morphAnims) {
-					const effect = a.effect as KeyframeEffect;
-					if (dir === "out" && effect.target?.matches(MORPH_FADE)) {
-						// An interrupted entrance starts fading from its visible opacity.
-						effect.setKeyframes(dismissFade(
-							effect.getComputedTiming().progress ?? 1,
-							Number(getComputedStyle(effect.target).opacity),
-						));
-					}
 					const own = Number(a.effect?.getTiming().duration) || duration;
-					a.updatePlaybackRate((rate * own) / duration);
+					a.playbackRate = ((dir === morphBuiltFor ? 1 : -1) * own) / duration;
 				}
 				return { duration };
 			}
-			clearMorph();
+			morphAnims.forEach((a) => a.cancel());
+			morphAnims = [];
+			morphBuiltFor = dir;
 
 			const anchorEl = document.querySelector<HTMLElement>("[data-np-anchor]");
 			const anchor = anchorEl?.getBoundingClientRect();
-			if (!anchor?.width) return sheet(node, { duration });
+			if (
+				!anchor?.width ||
+				matchMedia("(prefers-reduced-motion: reduce)").matches
+			)
+				return sheet(node, { offset: dragY });
 
-			// One closed → open timeline. Reversals keep the current frame on each element.
+			// Frames are written for opening; closing plays them backwards on the same curve.
 			const play = (el: Element, frames: Keyframe[]) => {
-				const anim = el.animate(frames, {
+				const keyframes =
+					dir === "out"
+						? frames
+								.map((f) => ({ ...f, offset: 1 - (f.offset as number) }))
+								.reverse()
+						: frames;
+				const anim = el.animate(keyframes, {
 					duration,
 					easing: MORPH_EASE,
 					fill: "both",
 				});
-				if (dir === "out") {
-					anim.currentTime = duration;
-					anim.playbackRate = -1;
-				}
+				// Once fully open, hand the elements back to their normal styles.
+				// (Fully closed needs nothing: Svelte removes the sheet.)
+				anim.onfinish = () => {
+					if (morphDir !== "in") return;
+					morphAnims.forEach((a) => a.cancel());
+					morphAnims = [];
+				};
 				morphAnims.push(anim);
 			};
 
-			// The sheet's translation returns to zero while the morph plays. Measure
-			// the destination relative to its resting box, including after a drag.
+			// Measured against the sheet's own box so a swipe-down offset is respected.
+			const box = node.getBoundingClientRect();
 			const inset = [
-				anchor.top,
+				anchor.top - box.top,
 				box.right - anchor.right,
-				box.height - anchor.bottom,
+				box.bottom - anchor.bottom,
 				anchor.left - box.left,
 			];
 
 			// Artwork: the cover flies between the mini player's thumbnail and the
 			// hero box, so both directions read as the same image moving.
 			// With a panel open (portrait) the big image is hidden; the thumbnail flies instead.
-			// The parent already cleared ui.panel on Back/close. The outgoing DOM
-			// still shows the panel thumbnail and supplies its actual geometry.
-			const portraitHero = isPortrait && !node.classList.contains("panel-open");
 			const hero = node.querySelector<HTMLElement>(
-				portraitHero ? ".backdrop-layer.active .backdrop-art" : ".art-row .art-wrap",
+				mobileOpen && isPortrait ? ".art-row .art-wrap" : ".backdrop-art",
 			);
 			const from = document
 				.querySelector<HTMLElement>("[data-np-art]")
 				?.getBoundingClientRect();
 			if (hero && from?.width) {
-				const wrap = hero.getBoundingClientRect();
-				const to = hero.querySelector(".art-layers")?.getBoundingClientRect() ?? wrap;
+				const to = hero.getBoundingClientRect();
 				if (to.width > 1 && to.height > 1) {
-					const origin = `${to.left - wrap.left}px ${to.top - wrap.top}px`;
 					const sx = from.width / to.width;
 					const sy = from.height / to.height;
 					const dx = from.left - to.left;
-					const dy = from.top - to.top + box.top;
+					const dy = from.top - to.top;
 					play(hero, [
 						{
 							offset: 0,
-							transformOrigin: origin,
+							transformOrigin: "0 0",
 							transform: `translate3d(${dx}px, ${dy}px, 0) scale(${sx}, ${sy})`,
 						},
 						{
 							offset: 1,
-							transformOrigin: origin,
+							transformOrigin: "0 0",
 							transform: "translate3d(0, 0, 0) scale(1, 1)",
 						},
 					]);
@@ -823,12 +805,16 @@
 					parseFloat(getComputedStyle(source).fontSize) /
 					parseFloat(getComputedStyle(target).fontSize);
 				const dx = a.left - t.left;
-				const dy = a.top + a.height / 2 - (t.top + (t.height * s) / 2) + box.top;
+				const dy = a.top + a.height / 2 - (t.top + (t.height * s) / 2);
 				lead ??= { dx, dy, s, box: t };
 				// Fully visible from the first frame (it sits exactly over the mini text the
 				// pill just covered) and recoloured from the mini's colour to its own.
 				const fromColor = getComputedStyle(source).color;
 				const toColor = getComputedStyle(target).color;
+				// Typography (weight, letter spacing): closing uses the mini's from the
+				// very first frame, so the line doesn't change weight or width when the
+				// real mini text takes over; opening switches to its own once, halfway
+				// (either change re-lays out the text, so it isn't interpolated).
 				// The mini's spacing is converted to this element's (scaled) units.
 				const src = getComputedStyle(source);
 				const tgt = getComputedStyle(target);
@@ -843,10 +829,11 @@
 					fromType.fontWeight !== toType.fontWeight ||
 					fromType.letterSpacing !== toType.letterSpacing
 				) {
+					const end = dir === "out" ? fromType : toType;
 					play(target, [
 						{ offset: 0, ...fromType, easing: "step-end" },
-						{ offset: 0.5, ...toType },
-						{ offset: 1, ...toType },
+						{ offset: 0.5, ...end },
+						{ offset: 1, ...end },
 					]);
 				}
 				// Transform in its own animation (compositor); colour separately and
@@ -896,7 +883,7 @@
 				}
 				const s = a.width / b.width;
 				const dx = a.left + a.width / 2 - (b.left + b.width / 2);
-				const dy = a.top + a.height / 2 - (b.top + b.height / 2) + box.top;
+				const dy = a.top + a.height / 2 - (b.top + b.height / 2);
 				// Scale about the icon's centre, wherever it sits in the button.
 				const t = target.getBoundingClientRect();
 				const origin = `${b.left + b.width / 2 - t.left}px ${b.top + b.height / 2 - t.top}px`;
@@ -918,17 +905,17 @@
 					]);
 			}
 
-			// Hand the wash to the dock material only at the pill end of the flight.
-			// The hero image stays visible until it reaches the dock thumbnail.
-			for (const wash of node.querySelectorAll(".ambient")) {
-				play(wash, [
-					{ offset: 0, opacity: 0 },
-					{ offset: 0.24, opacity: 1 },
+			const backdrop = node.querySelector(".backdrop");
+			if (backdrop) {
+				// Keep the artwork visible throughout: the sheet clip (and the hero
+				// art flight) carry the transition, never a plain fade.
+				play(backdrop, [
+					{ offset: 0, opacity: 1 },
 					{ offset: 1, opacity: 1 },
 				]);
 			}
 			for (const el of node.querySelectorAll(MORPH_FADE))
-				play(el, dir === "out" ? dismissFade() : [
+				play(el, [
 					{ offset: 0, opacity: 0 },
 					{ offset: 0.55, opacity: 0 },
 					{ offset: 1, opacity: 1 },
@@ -952,12 +939,17 @@
 <svelte:window onkeydowncapture={onKey} />
 
 <div
-	transition:morph|global
-	onintroend={clearMorph}
+	transition:morph
 	class="np"
+	class:tinted={!!displayTint}
+	class:closing={!ui.nowPlaying}
 	class:panel-open={mobileOpen}
+	style:--np-top={displayTint?.top}
+	style:--np-bottom={displayTint?.bottom}
 	style:--np-h="{npHeight}px"
 	bind:clientHeight={npHeight}
+	style:transform={dragY ? `translateY(${dragY}px)` : undefined}
+	style:transition={dragY || !ui.nowPlaying ? "none" : undefined}
 	ontouchstart={onTouchStart}
 	ontouchmove={onTouchMove}
 	ontouchend={onTouchEnd}
@@ -968,32 +960,64 @@
 	aria-modal="true"
 	aria-label="Now Playing"
 >
-	{#snippet backdropArt(track: DisplayTrack)}
-		{@const washArt = coverUrl(track.coverArt, 64)}
-		{@const heroArt = coverUrl(track.coverArt, 1200)}
-		<div
-			class="ambient"
-			class:sampled={!!track.tint?.ambient}
-			style:--top={track.tint?.ambient ?? track.tint?.top}
-			style:--bottom={track.tint?.bottom}
-			style:--wash-art={washArt ? `url(${JSON.stringify(washArt)})` : undefined}
-		></div>
-		<div
-			class="backdrop-art"
-			style:background-image={heroArt ? `url(${JSON.stringify(heroArt)})` : undefined}
-		></div>
-	{/snippet}
 	<div class="backdrop" bind:this={backdropEl} aria-hidden="true">
 		{#if currentDisplay}
 			{#key currentDisplay.id}
-				<div class="backdrop-layer active" out:fadeOnly={{ duration: 450 }}>
-					{@render backdropArt(currentDisplay)}
+				<div class="backdrop-layer active" out:backdropOut={{ duration: 450 }}>
+					{#if currentDisplay.tint}
+						<div
+							class="tint-flat"
+							style:--top={currentDisplay.tint.top}
+							style:--bottom={currentDisplay.tint.bottom}
+						></div>
+					{/if}
+					<img
+						class="backdrop-art"
+						src={coverUrl(currentDisplay.coverArt, 1200)}
+						alt=""
+						draggable="false"
+					/>
+					{#if currentDisplay.tint}
+						<div
+							class="tint"
+							style:--top={currentDisplay.tint.top}
+							style:--bottom={currentDisplay.tint.bottom}
+							style:--accent={currentDisplay.tint.accent ?? currentDisplay.tint.top}
+							style:--glow={currentDisplay.tint.glow ?? 'transparent'}
+						>
+							<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
+						</div>
+					{/if}
 				</div>
 			{/key}
 		{/if}
+
 		{#if incomingDisplay}
 			<div class="backdrop-layer incoming" class:fading-in={incomingActive}>
-				{@render backdropArt(incomingDisplay)}
+				{#if incomingDisplay.tint}
+					<div
+						class="tint-flat"
+						style:--top={incomingDisplay.tint.top}
+						style:--bottom={incomingDisplay.tint.bottom}
+					></div>
+				{/if}
+				<img
+					class="backdrop-art"
+					src={coverUrl(incomingDisplay.coverArt, 1200)}
+					alt=""
+					draggable="false"
+				/>
+				{#if incomingDisplay.tint}
+					<div
+						class="tint"
+						style:--top={incomingDisplay.tint.top}
+						style:--bottom={incomingDisplay.tint.bottom}
+						style:--accent={incomingDisplay.tint.accent ?? incomingDisplay.tint.top}
+						style:--glow={incomingDisplay.tint.glow ?? 'transparent'}
+					>
+						<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
+					</div>
+				{/if}
 			</div>
 		{/if}
 	</div>
@@ -1496,10 +1520,11 @@
 		inset: 0;
 		z-index: 50;
 		color: #fff;
-		background: var(--chrome-strong, #3a3a3c);
+		background: #3a3a3c;
 		overflow: hidden;
 		display: flex;
 		flex-direction: column;
+		transition: transform 0.25s ease;
 		--text: #fff;
 		--text-2: rgb(255 255 255 / 0.6);
 		--slider-fill: rgb(255 255 255 / 0.62);
@@ -1511,6 +1536,7 @@
 		position: absolute;
 		inset: 0;
 		z-index: -1;
+		background: #1c1c1e;
 		contain: strict;
 		overflow: hidden;
 	}
@@ -1545,33 +1571,95 @@
 	.backdrop-layer.incoming.fading-in {
 		opacity: 1;
 	}
-	.ambient {
-		position: absolute;
-		inset: 0;
-		overflow: hidden;
-		background: linear-gradient(155deg, var(--top, #485169), var(--bottom, #303448));
-	}
-	/* A small, enlarged copy of the cover keeps its local colours visible and
-	   also works for artwork that browsers can display but cannot sample. */
-	.ambient::before {
-		content: "";
-		position: absolute;
-		inset: 35%;
-		transform: scale(4);
-		background: var(--wash-art, none) center / cover no-repeat;
-		filter: blur(10px) saturate(1.12) brightness(0.54);
-	}
-	.ambient.sampled::before {
-		opacity: 0.42;
-	}
-	.ambient::after {
-		content: "";
-		position: absolute;
-		inset: 0;
-		background: linear-gradient(165deg, transparent, rgb(0 0 0 / 0.16));
-	}
 	.backdrop-art {
+		position: absolute;
+		inset: -4%;
+		width: 108%;
+		height: 108%;
+		z-index: 0;
+		object-fit: cover;
+		object-position: center;
+		filter: saturate(1.08);
+		pointer-events: none;
+		user-select: none;
+	}
+	.tint {
+		position: absolute;
+		inset: 0;
+		z-index: 1;
+		background:
+			linear-gradient(
+				180deg,
+				rgb(0 0 0 / 0.06) 0%,
+				rgb(0 0 0 / 0.16) 38%,
+				rgb(0 0 0 / 0.62) 100%
+			),
+			radial-gradient(120% 80% at 50% 25%, transparent 45%, rgb(0 0 0 / 0.32) 100%);
+		overflow: hidden;
+	}
+	.np.closing {
+		background: var(--chrome-strong, rgba(30, 30, 30, 0.95));
+	}
+	/* The sheet clips down onto the mini pill while it closes. Paint that strip
+	   with the mini player's own background from the very first frame, otherwise
+	   the tinted backdrop (#1c1c1e + gradient) shows through and the colour jumps
+	   the instant the sheet is removed and the real mini player takes over. */
+	.np.closing .backdrop {
+		background: var(--chrome-strong, rgba(30, 30, 30, 0.95));
+	}
+	.np.closing .backdrop::after {
 		display: none;
+	}
+	.np.closing .tint,
+	.np.closing .tint-flat {
+		opacity: 0;
+		transition: none;
+	}
+	/* Flat tint shown instead of the cover while a panel is open (portrait only). */
+	.tint-flat {
+		display: none;
+	}
+	.mesh-aura {
+		position: absolute;
+		inset: -15%;
+		background: radial-gradient(circle at 50% 30%, var(--glow, transparent) 0%, transparent 60%);
+		opacity: 0.65;
+		animation: auraPulse 16s ease-in-out infinite alternate;
+		will-change: transform, opacity;
+		pointer-events: none;
+	}
+	.mesh-aura.paused {
+		animation-play-state: paused;
+	}
+	@keyframes auraPulse {
+		0% {
+			transform: scale(0.96) translate3d(0, 0, 0);
+			opacity: 0.45;
+		}
+		50% {
+			transform: scale(1.06) translate3d(2%, -1%, 0);
+			opacity: 0.8;
+		}
+		100% {
+			transform: scale(1) translate3d(-1%, 2%, 0);
+			opacity: 0.55;
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.mesh-aura {
+			animation: none;
+		}
+	}
+	.backdrop::after {
+		content: "";
+		position: absolute;
+		inset: 0;
+		z-index: 3;
+		background: linear-gradient(
+			to bottom,
+			transparent 55%,
+			rgb(0 0 0 / 0.18)
+		);
 	}
 
 	/* ---- header --------------------------------------------------------------- */
@@ -2398,14 +2486,54 @@
 			display: none;
 		}
 		.backdrop-art {
-			position: absolute;
-			display: block;
-			inset: 0 0 auto;
+			inset: 0 0 auto 0;
+			width: 100%;
 			height: 52vh;
-			background-position: center;
-			background-size: cover;
-			background-repeat: no-repeat;
-			mask-image: linear-gradient(to bottom, #000 0% 85%, transparent);
+			object-position: center;
+			-webkit-mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 86%,
+				transparent 100%
+			);
+			mask-image: linear-gradient(to bottom, #000 0%, #000 86%, transparent 100%);
+		}
+		.tint {
+			background: none;
+		}
+		/* Hero state: transparent over the cover, tinted wash below. */
+		.tint::before {
+			content: "";
+			position: absolute;
+			inset: 0;
+			background: linear-gradient(
+				180deg,
+				rgb(0 0 0 / 0) 0%,
+				rgb(0 0 0 / 0) 42%,
+				color-mix(in srgb, var(--top) 26%, rgb(0 0 0 / 0.25)) 56%,
+				color-mix(in srgb, var(--bottom) 62%, #000 38%) 100%
+			);
+			transition: opacity 0.55s ease;
+		}
+		/* Panel state: no cover behind, just one tint. Opacity only (compositor). */
+		.tint-flat {
+			display: block;
+			position: absolute;
+			inset: 0;
+			z-index: 0;
+			opacity: 0;
+			background: linear-gradient(
+				180deg,
+				color-mix(in srgb, var(--top) 70%, #000 30%) 0%,
+				color-mix(in srgb, var(--bottom) 62%, #000 38%) 100%
+			);
+			transition: opacity 0.55s ease;
+		}
+		.np.panel-open .tint-flat {
+			opacity: 1;
+		}
+		.np.panel-open .tint::before {
+			opacity: 0;
 		}
 		/* The cover is hidden while a panel is open; heroFlip animates it in/out. */
 		.np.panel-open .backdrop-art {
@@ -2413,4 +2541,12 @@
 		}
 	}
 
+	@media (orientation: landscape) {
+		.backdrop-art {
+			display: none;
+		}
+		.tint {
+			background: linear-gradient(180deg, var(--top), var(--bottom));
+		}
+	}
 </style>
