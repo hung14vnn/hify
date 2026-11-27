@@ -10,7 +10,7 @@
 	import { toggleKaraoke } from "../karaoke";
 	import { songMenu } from "../menus";
 	import type { TransitionConfig } from "svelte/transition";
-	import { fadeOnly, pop, sheet, textSwap } from "../motion";
+	import { fadeOnly, pop, rise, sheet, textSwap } from "../motion";
 	import {
 		coverUrl,
 		getPlaybackQuality,
@@ -1330,10 +1330,10 @@
 								{:else if mix}
 									<span
 										class="fade-notice"
-										in:fadeOnly={{ duration: 200 }}
+										in:rise={{ distance: 5, duration: 260 }}
 										out:fadeOnly={{ duration: 180 }}
 									>
-										<Icon name="crossfade" size={11} />
+										<Icon name={mix.autoMix ? "autoMix" : "crossfade"} size={11} />
 										<span class="fade-notice-text">
 											{mix.autoMix ? "Mixing" : "Fading"} into
 											“{mix.song.title}”
@@ -1992,13 +1992,13 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
-	/* Subtle crossfade notice: clean inline status text between timestamps (non-badge, non-clickable) */
+	/* Subtle crossfade notice: Apple-style shimmer sweep + gentle icon pulse between timestamps */
 	.fade-notice {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
 		gap: 5px;
-		color: rgb(255 255 255 / 0.52);
+		color: rgb(255 255 255 / 0.58);
 		font-size: 10.5px;
 		font-weight: 500;
 		letter-spacing: 0.01em;
@@ -2007,13 +2007,46 @@
 		user-select: none;
 	}
 	.fade-notice :global(svg) {
-		opacity: 0.75;
+		opacity: 0.85;
 		flex-shrink: 0;
+		animation: mixPulse 2.2s ease-in-out infinite;
 	}
 	.fade-notice-text {
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+		background: linear-gradient(
+			90deg,
+			rgb(255 255 255 / 0.52) 0%,
+			rgb(255 255 255 / 0.52) 35%,
+			rgb(255 255 255 / 0.98) 50%,
+			rgb(255 255 255 / 0.52) 65%,
+			rgb(255 255 255 / 0.52) 100%
+		);
+		background-size: 220% 100%;
+		background-position: 100% 0;
+		-webkit-background-clip: text;
+		background-clip: text;
+		color: transparent;
+		animation: mixShimmer 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+	}
+	@keyframes mixShimmer {
+		0% { background-position: 100% 0; }
+		100% { background-position: -120% 0; }
+	}
+	@keyframes mixPulse {
+		0%, 100% { opacity: 0.65; transform: scale(0.96); }
+		50% { opacity: 1; transform: scale(1.06); }
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.fade-notice :global(svg) {
+			animation: none;
+		}
+		.fade-notice-text {
+			animation: none;
+			background: none;
+			color: rgb(255 255 255 / 0.68);
+		}
 	}
 	.quality {
 		font-size: 11px;
@@ -2283,7 +2316,7 @@
 	/* ---- phones --------------------------------------------------------------- */
 	@media (max-width: 899px) {
 		.np {
-			border-radius: 20px 20px 0 0;
+			border-radius: 24px 24px 0 0;
 		}
 		.layout {
 			flex-direction: column;

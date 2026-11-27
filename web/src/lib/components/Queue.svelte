@@ -134,6 +134,13 @@
 			scrollToPlayingNext();
 		});
 	}
+	const transitionMode = $derived(
+		!player.webAudio || !audioSettings.crossfade
+			? "Off"
+			: audioSettings.autoMix
+				? "AutoMix"
+				: "Crossfade",
+	);
 </script>
 
 <div class="queue">
@@ -170,16 +177,18 @@
 			<Icon name={player.repeat === "one" ? "repeatOne" : "repeat"} size={19} />
 		</button>
 		<button
-			class:on={player.webAudio && audioSettings.crossfade}
-			aria-pressed={player.webAudio && audioSettings.crossfade}
+			class:on={transitionMode !== "Off"}
+			aria-pressed={transitionMode !== "Off"}
 			disabled={!player.webAudio}
 			aria-label={player.webAudio
-				? audioSettings.autoMix ? "AutoMix" : "Crossfade"
-				: "Crossfade — requires the Web Audio engine (Account › Playback)"}
-			title={player.webAudio ? (audioSettings.autoMix ? "AutoMix" : "Crossfade") : "Crossfade requires the Web Audio engine"}
-			onclick={() => audioSettings.setCrossfade(!audioSettings.crossfade)}
+				? `Transition: ${transitionMode}`
+				: "Transition — requires the Web Audio engine (Account › Playback)"}
+			title={player.webAudio
+				? `Transition: ${transitionMode}`
+				: "Crossfade & AutoMix require the Web Audio engine"}
+			onclick={() => audioSettings.cycleTransition()}
 		>
-			<Icon name="crossfade" size={19} />
+			<Icon name={transitionMode === "AutoMix" ? "autoMix" : "crossfade"} size={19} />
 		</button>
 	</div>
 
