@@ -2,21 +2,25 @@
 // playback).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Song } from './types';
+import type { AutoMixInfo } from './api';
 
 type LocalCopy = { url: string; revoke: () => void };
 const getSession = vi.fn<() => { username: string } | null>();
 const getOffline = vi.fn<(_user: string, _id: string) => Promise<LocalCopy | null>>();
+const getAutoMixInfo = vi.fn<(_id: string, _token: string, _signal: AbortSignal) => Promise<AutoMixInfo | null>>();
 vi.mock('./offline', () => ({ createOfflineTrackUrl: getOffline }));
 vi.mock('./api', () => ({
 	getPlayQueue: vi.fn(async () => null),
 	savePlayQueue: vi.fn(),
 	scrobble: vi.fn(),
-	streamUrl: (id: string) => `https://music.test/rest/stream?id=${id}`,
+	streamUrl: (id: string, _bust?: number, _offset?: number, _format?: string, token?: string) =>
+		`https://music.test/rest/stream?id=${id}${token ? `&autoMix=1&mixToken=${token}` : ''}`,
 	coverUrl: () => undefined,
+	getAutoMixInfo,
 	getSession
 }));
 
-const sleepTimer = { onTrackEnded: vi.fn(() => false) };
+const sleepTimer = { onTrackEnded: vi.fn(() => false), isEndOfTrack: false };
 vi.mock('./sleepTimer.svelte', () => ({ sleepTimer }));
 
 class FakeAudio extends EventTarget {
@@ -76,6 +80,10 @@ class FakeAudio extends EventTarget {
 		this.readyState = 4;
 		this.fire('canplay');
 	}
+	startPlaying() {
+		this.ready();
+		this.fire('playing');
+	}
 	fire(type: string) {
 		this.dispatchEvent(new Event(type));
 	}
@@ -88,6 +96,19 @@ class FakeAudioSession extends EventTarget {
 		this.state = state;
 		this.dispatchEvent(new Event('statechange'));
 	}
+}
+
+class FakeWebAudioOutput {
+	attach() {}
+	setVolume() {}
+	setTrim() {}
+	quickFadeIn() {}
+	silenceFade() {}
+	crossfade() {}
+	resetFade(_el: HTMLAudioElement) {}
+	trackChanged() {}
+	resume() {}
+	dispose() {}
 }
 
 const song = (id: string, duration = 200) => ({ id, title: id, duration }) as Song;
@@ -120,6 +141,7 @@ beforeEach(() => {
 	localStorage.clear();
 	getSession.mockReset().mockReturnValue(null);
 	getOffline.mockReset().mockResolvedValue(null);
+	getAutoMixInfo.mockReset().mockResolvedValue(null);
 	FakeAudio.all = [];
 	vi.stubGlobal('Audio', FakeAudio);
 	// The player mounts its elements in the document; the fake is not a DOM node.
@@ -129,6 +151,7 @@ beforeEach(() => {
 	URL.createObjectURL = vi.fn(() => `blob:test/${++n}`);
 	URL.revokeObjectURL = vi.fn();
 	sleepTimer.onTrackEnded.mockReset().mockReturnValue(false);
+	sleepTimer.isEndOfTrack = false;
 });
 
 afterEach(() => {
@@ -137,6 +160,74 @@ afterEach(() => {
 });
 
 describe('Player track changes', () => {
+	it.each([200, 400])('gives a cold %i-second stream the first request, then prepares its successor', async (duration) => {
+		getSession.mockReturnValue({ username: 'listener' });
+		const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+			new Response(new Uint8Array(20_000), { headers: { 'content-type': 'audio/flac' } }));
+		vi.stubGlobal('fetch', fetchMock);
+		const { player, audio } = await freshPlayer();
+		audio.play.mockImplementationOnce(() => {
+			audio.paused = false;
+			audio.fire('play');
+			return new Promise(() => {});
+		});
+		player.playList([song('st-selected', duration), song('yt-next')]);
+		await vi.dynamicImportSettled();
+		expect(getOffline.mock.calls.map(([, id]) => id)).toEqual(['st-selected', 'yt-next']);
+		expect(audio.src).toContain('id=st-selected');
+		expect(audio.play).toHaveBeenCalledOnce();
+		audio.ready();
+		audio.fire('timeupdate');
+		expect(fetchMock).not.toHaveBeenCalled();
+
+		audio.fire('playing');
+		await flush();
+		expect(player.current?.suffix).toBe('flac');
+		expect(fetchMock.mock.calls.map(([url, init]) => [new URL(url).searchParams.get('id'), init?.headers])).toEqual([
+			['st-selected', { Range: 'bytes=0-1' }],
+			['yt-next', duration > 300 ? { Range: 'bytes=0-1' } : undefined]
+		]);
+		player.pause();
+		player.resume();
+		audio.fire('playing');
+		await flush();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+	});
+
+	it('cancels a stale codec result on quality reload and learns the resumed stream when playing is missed', async () => {
+		const old = deferred<Response>();
+		const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+			new Response('', { headers: { 'content-type': 'audio/flac' } }));
+		fetchMock.mockImplementationOnce(() => old.promise);
+		vi.stubGlobal('fetch', fetchMock);
+		const { player, audio } = await freshPlayer();
+		player.playList([song('yt-selected')]);
+		await flush();
+		audio.ready();
+		audio.fire('playing');
+		expect(fetchMock).toHaveBeenCalledOnce();
+		player.pause();
+		player.reloadCurrent();
+		await flush();
+		expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+		audio.ready();
+		audio.fire('playing'); // A queued notification after pause cannot start work.
+		expect(fetchMock).toHaveBeenCalledOnce();
+
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		try {
+			player.resume(); // An already playable element can fulfill play() without another playing event.
+			await flush();
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+			expect(player.current?.suffix).toBe('flac');
+			old.resolve(new Response('', { headers: { 'content-type': 'audio/mpeg' } }));
+			await flush();
+			expect(player.current?.suffix).toBe('flac');
+		} finally {
+			hidden.mockRestore();
+		}
+	});
+
 	it('starts the tapped song: set src, load(), play(), spinner until canplay', async () => {
 		const { player, audio } = await freshPlayer();
 		// A play() that hasn't settled yet: the source is still loading.
@@ -198,10 +289,9 @@ describe('Player track changes', () => {
 		const { player, audio } = await freshPlayer();
 		player.playList([song('a', 400), song('b')]);
 		await flush();
-		audio.ready();
+		audio.startPlaying();
 		playTo(audio, 40);
-		// The load already probed the next stream (Range warm-start); the whole-track
-		// download must still wait for the lead window.
+		// Playback has started, but the whole-track download must wait for the lead window.
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(fetchMock.mock.calls[0][1]).toMatchObject({ headers: { Range: 'bytes=0-1' } });
 		fetchMock.mockClear();
@@ -215,6 +305,71 @@ describe('Player track changes', () => {
 		expect(player.current?.id).toBe('b');
 		const active = FakeAudio.all.find((a) => a.src.startsWith('blob:') && !a.paused);
 		expect(active).toBeDefined();
+	});
+
+	it('learns the codec from a complete successor download on retry and keeps it through the blob handoff', async () => {
+		const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(audioResponse()));
+		const headers = { 'content-type': 'audio/flac', 'x-audio-bit-depth': '24', 'x-audio-sample-rate': '96000' };
+		fetchMock.mockResolvedValueOnce(new Response(new Uint8Array(20_000), {
+			headers: { ...headers, 'content-length': '80000' }
+		}));
+		fetchMock.mockResolvedValueOnce(new Response(new Uint8Array(20_000), { headers }));
+		vi.stubGlobal('fetch', fetchMock);
+		const { player, audio } = await freshPlayer();
+		vi.useFakeTimers();
+		try {
+			const original = { suffix: 'opus', bitDepth: 16, sampleRate: 48000 };
+			player.playList([song('a'), { ...song('yt-b'), ...original }]);
+			await vi.advanceTimersByTimeAsync(0);
+			audio.startPlaying();
+			await vi.advanceTimersByTimeAsync(0);
+			expect(player.nextSong).toMatchObject(original);
+			expect(URL.createObjectURL).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(4_100);
+			playTo(audio, 10);
+			await vi.advanceTimersByTimeAsync(0);
+			const resolved = { suffix: 'flac', bitDepth: 24, sampleRate: 96000 };
+			expect(player.nextSong).toMatchObject(resolved);
+			audio.fire('ended');
+			const standby = FakeAudio.all[1];
+			expect(standby.src).toMatch(/^blob:/);
+			standby.startPlaying();
+			expect(player.current).toMatchObject({ id: 'yt-b', ...resolved });
+			expect(fetchMock.mock.calls.map(([url, init]) => [new URL(url).searchParams.get('id'), init?.headers])).toEqual([
+				['yt-b', undefined], ['yt-b', undefined]
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('ignores the old quality when its successor download finishes after the replacement', async () => {
+		let oldBody!: ReadableStreamDefaultController<Uint8Array>;
+		const oldStream = new ReadableStream<Uint8Array>({ start(controller) { oldBody = controller; } });
+		const fetchMock = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve(audioResponse()));
+		fetchMock.mockResolvedValueOnce(new Response(oldStream, {
+			headers: { 'content-type': 'audio/flac', 'x-audio-bit-depth': '24', 'x-audio-sample-rate': '96000' }
+		}));
+		fetchMock.mockResolvedValueOnce(new Response(new Uint8Array(20_000), { headers: { 'content-type': 'audio/mpeg' } }));
+		vi.stubGlobal('fetch', fetchMock);
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), { ...song('yt-b'), suffix: 'opus' }]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		expect(player.nextSong?.suffix).toBe('opus');
+		player.reloadCurrent();
+		expect(fetchMock.mock.calls[0][1]?.signal?.aborted).toBe(true);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		oldBody.enqueue(new Uint8Array(20_000));
+		oldBody.close();
+		await flush();
+		expect(URL.createObjectURL).toHaveBeenCalledOnce();
+		expect(player.nextSong?.suffix).toBe('mp3');
+		expect(player.nextSong?.bitDepth).toBeUndefined();
+		expect(player.nextSong?.sampleRate).toBeUndefined();
 	});
 
 	it('retries a track that fails in the background after a pause, not at once', async () => {
@@ -334,6 +489,322 @@ describe('Player track changes', () => {
 		audio.duration = 201.5;
 		audio.fire('durationchange');
 		expect(player.duration).toBe(201.5);
+	});
+});
+
+describe('AutoMix playback', () => {
+	beforeEach(() => {
+		vi.doMock('./playback/webAudioOutput', () => ({ WebAudioOutput: FakeWebAudioOutput }));
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio', crossfade: true, autoMix: true }));
+		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
+	});
+
+	afterEach(() => vi.doUnmock('./playback/webAudioOutput'));
+
+	it.each([
+		{ intro: 5, outro: 9, lead: 5, adaptive: true },
+		{ intro: 15, outro: 3, lead: 3, adaptive: true },
+		{ intro: 50, outro: 40, lead: 12, adaptive: true },
+		{ intro: 0.5, outro: 9, lead: 8, adaptive: false },
+		{ intro: null, outro: 9, lead: 8, adaptive: false }
+	])('uses a $lead-second overlap for an outro of $outro and intro of $intro', async ({ intro, outro, lead, adaptive }) => {
+		getAutoMixInfo.mockImplementation(async (id) => id === 'a'
+			? { introSeconds: 0, outroSeconds: outro }
+			: intro === null ? null : { introSeconds: intro, outroSeconds: 0 });
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b'), song('c')]);
+		await flush();
+		expect(audio.src).toContain('autoMix=1');
+		expect(getAutoMixInfo).not.toHaveBeenCalled();
+		audio.startPlaying();
+		await flush();
+		expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'b']);
+		const [outgoing, incoming] = getAutoMixInfo.mock.calls.map(([, token]) => token);
+		expect(new URL(audio.src).searchParams.get('mixToken')).toBe(outgoing);
+		expect(incoming).not.toBe(outgoing);
+		expect(fetch).toHaveBeenCalledWith(`https://music.test/rest/stream?id=b&autoMix=1&mixToken=${incoming}`, expect.anything());
+		const standby = FakeAudio.all[1];
+		standby.ready();
+		playTo(audio, 185);
+		await flush();
+		playTo(audio, 200 - lead - 0.1);
+		expect(standby.play).not.toHaveBeenCalled();
+		playTo(audio, 200 - lead);
+		expect(standby.play).toHaveBeenCalledOnce();
+		expect(player.transition).toBeNull();
+		standby.fire('playing');
+		expect(player.transition).toMatchObject({ song: { id: 'b' }, autoMix: adaptive });
+		expect(player.transition?.duration).toBeCloseTo(lead, 1);
+		expect(player.current?.id).toBe('a');
+		audio.fire('ended');
+		expect(player.transition).toBeNull();
+		expect(player.current?.id).toBe('b');
+		standby.startPlaying();
+		await flush();
+		expect(getAutoMixInfo.mock.calls.filter(([id]) => id === 'b').every(([, token]) => token === incoming)).toBe(true);
+		expect(getAutoMixInfo.mock.calls.at(-1)?.[0]).toBe('c');
+	});
+
+	it('rechecks a missing analysis and ignores a result for a successor removed during its lookup', async () => {
+		const old = deferred<AutoMixInfo>();
+		let ready = false;
+		getAutoMixInfo.mockImplementation(async (id) => {
+			if (id === 'a') return { introSeconds: 0, outroSeconds: 11 };
+			if (id === 'b') return old.promise;
+			return ready ? { introSeconds: 4, outroSeconds: 0 } : null;
+		});
+		const { player, audio } = await freshPlayer();
+		let now = 1_000;
+		const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+		try {
+			player.playList([song('a'), song('b')]);
+			await flush();
+			audio.startPlaying();
+			await flush();
+			const oldSignal = getAutoMixInfo.mock.calls[1][2];
+			player.playNext([song('c')]);
+			await flush();
+			expect(oldSignal.aborted).toBe(true);
+			old.resolve({ introSeconds: 10, outroSeconds: 0 });
+			ready = true;
+			playTo(audio, 180);
+			expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'b', 'c']);
+			now += 6_000;
+			playTo(audio, 190);
+			await flush();
+			expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'b', 'c', 'a', 'c']);
+			const standby = FakeAudio.all[1];
+			playTo(audio, 195.9);
+			expect(standby.play).not.toHaveBeenCalled();
+			playTo(audio, 196);
+			standby.fire('playing');
+			expect(player.transition).toMatchObject({ song: { id: 'c' }, duration: 4, autoMix: true });
+			player.pause();
+			expect(standby.paused).toBe(true);
+			expect(player.transition).toBeNull();
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it.each(['invalidated', 'timed out', 'still waiting'])('uses the fixed fade when a previously analyzed stream is %s near handoff', async (reason) => {
+		const late = deferred<AutoMixInfo>();
+		const cue = { introSeconds: 12, outroSeconds: 12 };
+		let rangeChanged = false;
+		getAutoMixInfo.mockImplementation(async (id) => {
+			if (id !== 'a' || !rangeChanged) return cue;
+			return reason === 'invalidated' ? null : late.promise;
+		});
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		expect(getAutoMixInfo).not.toHaveBeenCalled();
+		audio.startPlaying();
+		await flush();
+		const standby = FakeAudio.all[1];
+		expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'b']);
+		rangeChanged = true;
+		vi.useFakeTimers();
+		try {
+			playTo(audio, 180);
+			playTo(audio, 185);
+			playTo(audio, 185.2);
+			await vi.advanceTimersByTimeAsync(reason === 'still waiting' ? 0 : 2500);
+			expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'b', 'a']);
+			if (reason === 'timed out') {
+				expect(getAutoMixInfo.mock.calls[2][2].aborted).toBe(true);
+				late.resolve(cue);
+				await vi.advanceTimersByTimeAsync(0);
+			}
+			playTo(audio, 188);
+			expect(standby.play).not.toHaveBeenCalled();
+			playTo(audio, 192);
+			standby.fire('playing');
+			expect(player.transition).toMatchObject({ song: { id: 'b' }, duration: 8, autoMix: false });
+			if (reason === 'still waiting') {
+				late.resolve(cue);
+				await vi.advanceTimersByTimeAsync(0);
+				expect(player.transition?.autoMix).toBe(false);
+			}
+			expect(getAutoMixInfo).toHaveBeenCalledTimes(3);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('turns on during playback and retains a prepared stream when the mode changes again', async () => {
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio' }));
+		vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+		const { player, audio } = await freshPlayer();
+		const { audioSettings } = await import('./playback/audioSettings.svelte');
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		const selectedUrl = audio.src;
+		expect(selectedUrl).not.toContain('autoMix');
+		expect(getAutoMixInfo).not.toHaveBeenCalled();
+		audioSettings.setAutoMix(true);
+		expect(audioSettings.crossfade).toBe(true);
+		expect(audio.src).toBe(selectedUrl);
+		expect(getAutoMixInfo).not.toHaveBeenCalled();
+		playTo(audio, 160);
+		const standby = FakeAudio.all[1];
+		standby.ready();
+		expect(standby.src).toContain('autoMix=1');
+		audioSettings.setCrossfade(false);
+		expect(audioSettings.autoMix).toBe(false);
+		audioSettings.flush();
+		expect(JSON.parse(localStorage.getItem('music.audio')!)).toMatchObject({ crossfade: false, autoMix: false });
+		audio.fire('ended');
+		expect(player.current?.id).toBe('b');
+		expect(standby.play).toHaveBeenCalledOnce();
+		expect(standby.load).toHaveBeenCalledOnce();
+	});
+
+	it('keeps the standard engine on a cut and omits analysis requests for a saved AutoMix preference', async () => {
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'element', crossfade: true, autoMix: true }));
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		playTo(audio, 194);
+		expect(audio.src).not.toContain('autoMix');
+		expect(fetch).toHaveBeenCalledWith('https://music.test/rest/stream?id=b', expect.anything());
+		expect(FakeAudio.all[1].play).not.toHaveBeenCalled();
+		expect(getAutoMixInfo).not.toHaveBeenCalled();
+	});
+
+	it('binds a fresh analysis to a replacement stream with the same song ID', async () => {
+		const old = deferred<AutoMixInfo>();
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		const first = new URL(audio.src).searchParams.get('mixToken');
+		getAutoMixInfo.mockImplementation(async (id, token) => {
+			if (id === 'a' && token === first) return old.promise;
+			return { introSeconds: 10, outroSeconds: 3 };
+		});
+		audio.startPlaying();
+		await flush();
+		player.reloadCurrent();
+		await flush();
+		const second = new URL(audio.src).searchParams.get('mixToken');
+		expect(second).toMatch(/^[a-zA-Z0-9_-]{1,96}$/);
+		expect(second).not.toBe(first);
+		expect(getAutoMixInfo.mock.calls.some(([, token]) => token === second)).toBe(false);
+		audio.startPlaying();
+		old.resolve({ introSeconds: 8, outroSeconds: 10 });
+		await flush();
+		expect(getAutoMixInfo.mock.calls.filter(([id]) => id === 'a').map(([, token]) => token)).toEqual([first, second]);
+		const standby = FakeAudio.all[1];
+		playTo(audio, 185);
+		await flush();
+		playTo(audio, 193);
+		expect(standby.play).not.toHaveBeenCalled();
+		playTo(audio, 197);
+		standby.fire('playing');
+		expect(player.transition).toMatchObject({ autoMix: true, song: { id: 'b' } });
+	});
+
+	it.each([2, 9])('bounds an unanalyzed fallback using the decoded %i-second successor', async (decoded) => {
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b', 200)]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		const standby = FakeAudio.all[1];
+		standby.duration = decoded;
+		standby.ready();
+		playTo(audio, 193);
+		expect(standby.play).not.toHaveBeenCalled();
+		playTo(audio, 197);
+		if (decoded === 2) {
+			expect(standby.play).not.toHaveBeenCalled();
+			audio.fire('ended');
+			expect(player.transition).toBeNull();
+			expect(player.current?.id).toBe('b');
+		} else {
+			standby.fire('playing');
+			expect(player.transition).toMatchObject({ autoMix: false, song: { id: 'b' } });
+			expect(player.transition?.duration).toBeCloseTo(3, 1);
+		}
+	});
+
+	it('withdraws a silent preroll when the successor turns out to be shorter than its metadata', async () => {
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		const standby = FakeAudio.all[1];
+		playTo(audio, 193);
+		expect(standby.play).toHaveBeenCalledOnce();
+		standby.duration = 2;
+		standby.startPlaying();
+		expect(standby.paused).toBe(true);
+		expect(player.transition).toBeNull();
+		expect(player.current?.id).toBe('a');
+	});
+
+	it('uses the fallback for a locally stored successor with no captured source token', async () => {
+		getSession.mockReturnValue({ username: 'listener' });
+		getOffline.mockImplementation(async (_user, id) => id === 'b' ? { url: 'blob:offline-b', revoke: vi.fn() } : null);
+		getAutoMixInfo.mockResolvedValue({ introSeconds: 12, outroSeconds: 12 });
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b')]);
+		await flush();
+		audio.startPlaying();
+		await flush();
+		const standby = FakeAudio.all[1];
+		expect(standby.src).toBe('blob:offline-b');
+		playTo(audio, 191);
+		expect(standby.play).not.toHaveBeenCalled();
+		playTo(audio, 192);
+		standby.fire('playing');
+		expect(player.transition).toMatchObject({ autoMix: false, song: { id: 'b' } });
+		expect(getAutoMixInfo.mock.calls.map(([id]) => id)).toEqual(['a', 'a']);
+	});
+
+	it('respects repeat-one, end-of-track sleep, seeks and a manual skip with an analyzed pair', async () => {
+		getAutoMixInfo.mockResolvedValue({ introSeconds: 6, outroSeconds: 8 });
+		const { player, audio } = await freshPlayer();
+		player.playList([song('a'), song('b'), song('c')]);
+		await flush();
+		audio.duration = 200;
+		audio.startPlaying();
+		await flush();
+		const standby = FakeAudio.all[1];
+		player.cycleRepeat();
+		player.cycleRepeat();
+		playTo(audio, 196);
+		expect(player.repeat).toBe('one');
+		expect(standby.play).not.toHaveBeenCalled();
+		sleepTimer.isEndOfTrack = true;
+		player.cycleRepeat();
+		await flush();
+		playTo(audio, 197);
+		expect(standby.play).not.toHaveBeenCalled();
+
+		sleepTimer.isEndOfTrack = false;
+		player.seek(180);
+		playTo(audio, 180);
+		await flush();
+		playTo(audio, 185);
+		await flush();
+		playTo(audio, 195);
+		standby.fire('playing');
+		expect(player.transition).toMatchObject({ song: { id: 'b' }, autoMix: true });
+		player.seek(100);
+		expect(standby.paused).toBe(true);
+		expect(player.transition).toBeNull();
+		playTo(audio, 196);
+		standby.fire('playing');
+		player.next();
+		expect(player.current?.id).toBe('b');
+		expect(audio.paused).toBe(true);
+		expect(player.transition).toBeNull();
 	});
 });
 
@@ -674,14 +1145,13 @@ describe('Player platform fixes', () => {
 
 describe('Player background track changes', () => {
 	/** Plays 'a' until the next track 'b' is downloaded and loaded into the standby element. */
-	async function withStandby() {
+	async function withStandby(duration = 200) {
 		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
 		const { player, audio } = await freshPlayer();
-		player.playList([song('a', 200), song('b'), song('c')]);
+		player.playList([song('a', duration), song('b'), song('c')]);
 		await flush();
-		audio.ready();
-		audio.fire('playing');
-		playTo(audio, 100);
+		audio.startPlaying();
+		playTo(audio, duration / 2);
 		await flush();
 		await flush();
 		return { player, audio };
@@ -714,6 +1184,111 @@ describe('Player background track changes', () => {
 		expect(player.current?.id).toBe('b');
 	});
 
+	it.each([
+		{ engine: 'element', crossfade: false },
+		{ engine: 'element', crossfade: true },
+		{ engine: 'webaudio', crossfade: false }
+	])('hidden Android, $engine with saved crossfade=$crossfade: hands off within the final second and cuts on playing', async (settings) => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		vi.doMock('./playback/webAudioOutput', () => ({ WebAudioOutput: FakeWebAudioOutput }));
+		localStorage.setItem('music.audio', JSON.stringify(settings));
+		try {
+			const { player, audio } = await withStandby();
+			const standby = FakeAudio.all[1];
+			standby.ready();
+			playTo(audio, 198.99);
+			expect(standby.play).not.toHaveBeenCalled();
+			playTo(audio, 199);
+			expect(standby.play).toHaveBeenCalledOnce();
+			expect(audio.paused).toBe(false);
+			standby.fire('waiting');
+			standby.ready();
+			expect(audio.paused).toBe(false);
+			standby.fire('playing');
+			expect(audio.paused).toBe(true);
+			expect(audio.src).toBe('');
+			audio.fire('ended');
+			expect(player.current?.id).toBe('b');
+		} finally {
+			vi.doUnmock('./playback/webAudioOutput');
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it.each([
+		{ platform: 'Android', hidden: false },
+		{ platform: 'Desktop', hidden: true }
+	])('keeps the usual element handoff on $platform with hidden=$hidden', async (settings) => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue(settings.platform);
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(settings.hidden);
+		try {
+			const { audio } = await withStandby();
+			const standby = FakeAudio.all[1];
+			standby.ready();
+			playTo(audio, 199.39);
+			expect(standby.play).not.toHaveBeenCalled();
+			playTo(audio, 199.41);
+			expect(standby.play).toHaveBeenCalledOnce();
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it.each([
+		{ duration: 200, lead: 8, blends: true },
+		{ duration: 20, lead: 0.6, blends: false }
+	])('hidden Android, Web Audio crossfade on: keeps the $lead-second transition for a $duration-second track', async ({ duration, lead, blends }) => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		vi.doMock('./playback/webAudioOutput', () => ({ WebAudioOutput: FakeWebAudioOutput }));
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio', crossfade: true }));
+		try {
+			const { audio, player } = await withStandby(duration);
+			const standby = FakeAudio.all[1];
+			standby.ready();
+			playTo(audio, duration - lead - 0.01);
+			expect(standby.play).not.toHaveBeenCalled();
+			playTo(audio, duration - lead + 0.01);
+			expect(standby.play).toHaveBeenCalledOnce();
+			standby.fire('playing');
+			expect(player.crossfading).toBe(blends);
+			expect(audio.paused).toBe(!blends);
+			expect(player.current?.id).toBe(blends ? 'a' : 'b');
+		} finally {
+			vi.doUnmock('./playback/webAudioOutput');
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
+	it('hidden Android: a refused early play lets the old track finish and retries its successor on return', async () => {
+		const ua = vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Android');
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+		try {
+			const { player, audio } = await withStandby();
+			const standby = FakeAudio.all[1];
+			standby.ready();
+			standby.play.mockRejectedValueOnce(new DOMException('blocked', 'NotAllowedError'));
+			playTo(audio, 199);
+			await flush();
+			expect(standby.play).toHaveBeenCalledOnce();
+			expect(audio.paused).toBe(false);
+			audio.fire('ended');
+			expect(audio.paused).toBe(true);
+			expect(player.current?.id).toBe('b');
+			hidden.mockReturnValue(false);
+			document.dispatchEvent(new Event('visibilitychange'));
+			expect(standby.play).toHaveBeenCalledTimes(2);
+			expect(standby.paused).toBe(false);
+		} finally {
+			hidden.mockRestore();
+			ua.mockRestore();
+		}
+	});
+
 	it('iOS: keeps a single element and swaps its source', async () => {
 		const userAgent = vi
 			.spyOn(navigator, 'userAgent', 'get')
@@ -737,7 +1312,7 @@ describe('Player background track changes', () => {
 			const { player, audio } = await freshPlayer();
 			player.playList([song('a'), song('b')]);
 			await flush();
-			audio.ready(); // No timeupdate before ended.
+			audio.startPlaying(); // No timeupdate before ended.
 			await flush();
 			const standby = FakeAudio.all[1];
 			expect(standby.src).toMatch(/^blob:/);
@@ -906,7 +1481,7 @@ describe('Player background track changes', () => {
 			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
 			player.playList([song('a'), song('b')]);
 			await vi.advanceTimersByTimeAsync(0);
-			audio.ready();
+			audio.startPlaying();
 			await vi.advanceTimersByTimeAsync(0);
 			audio.fire('ended');
 			const incoming = FakeAudio.all.find((el) => el.src.startsWith('blob:') && !el.paused)!;
@@ -943,7 +1518,7 @@ describe('Player background track changes', () => {
 		const { player, audio } = await freshPlayer();
 		player.playList([song('a', 200), song('b'), song('c')]);
 		await flush();
-		audio.ready();
+		audio.startPlaying();
 		playTo(audio, 100);
 		expect(FakeAudio.all).toHaveLength(1);
 		playTo(audio, 160);
@@ -961,6 +1536,38 @@ describe('Player background track changes', () => {
 		expect(audio.paused).toBe(true);
 	});
 
+	it('prepares the following song after a playing standby stream takes over on a hidden page', async () => {
+		const fetchMock = vi.fn((_url: string, _init?: RequestInit) => new Promise<Response>(() => {}));
+		vi.stubGlobal('fetch', fetchMock);
+		vi.doMock('./playback/webAudioOutput', () => ({ WebAudioOutput: FakeWebAudioOutput }));
+		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio', crossfade: true }));
+		const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+		try {
+			const { player, audio } = await freshPlayer();
+			player.playList([song('a'), song('yt-b', 400), song('c')]);
+			await flush();
+			audio.startPlaying();
+			playTo(audio, 160); // The download is still pending, so put the stream on standby.
+			const standby = FakeAudio.all[1];
+			expect(standby.src).toContain('id=yt-b');
+			standby.ready();
+			playTo(audio, 194);
+			standby.fire('playing');
+			expect(player.crossfading).toBe(true);
+			fetchMock.mockClear();
+			hidden.mockReturnValue(true);
+			document.dispatchEvent(new Event('visibilitychange'));
+			audio.fire('ended');
+			await flush(); // No new playing event for the already audible standby.
+			expect(player.current?.id).toBe('yt-b');
+			expect(standby.paused).toBe(false);
+			expect(fetchMock.mock.calls.map(([url]) => new URL(url).searchParams.get('id'))).toEqual(['yt-b', 'c']);
+		} finally {
+			hidden.mockRestore();
+			vi.doUnmock('./playback/webAudioOutput');
+		}
+	});
+
 	it('iOS: never streams on standby', async () => {
 		const userAgent = vi
 			.spyOn(navigator, 'userAgent', 'get')
@@ -970,7 +1577,7 @@ describe('Player background track changes', () => {
 			const { player, audio } = await freshPlayer();
 			player.playList([song('a', 200), song('b')]);
 			await flush();
-			audio.ready();
+			audio.startPlaying();
 			playTo(audio, 199.5);
 			expect(FakeAudio.all).toHaveLength(1);
 		} finally {
@@ -990,7 +1597,7 @@ describe('Player background track changes', () => {
 		const { player, audio } = await freshPlayer();
 		player.playList([song('a', 200), song('b')]);
 		await flush();
-		audio.ready();
+		audio.startPlaying();
 		playTo(audio, 100);
 		expect(signal?.aborted).toBe(false);
 		audio.fire('ended');
@@ -1203,10 +1810,11 @@ describe('Player queue edits', () => {
 			return result.promise;
 		}));
 		const { player, audio } = await freshPlayer();
-		player.playList([song('a'), song('b')]);
+		player.playList([song('a', 400), song('b')]);
 		await flush();
+		audio.startPlaying();
 		expect(requests[0].signal.aborted).toBe(false);
-		audio.ready();
+		playTo(audio, 100);
 		expect(requests[0].signal.aborted).toBe(true);
 		const first = requests[1];
 		player.addToQueue([song('c')]);
@@ -1239,7 +1847,7 @@ describe('Player queue edits', () => {
 		const { player, audio } = await freshPlayer();
 		player.playList([song('a'), song('b')]);
 		await flush();
-		audio.ready();
+		audio.startPlaying();
 		await flush();
 		expect(URL.createObjectURL).not.toHaveBeenCalled();
 		playTo(audio, 175);
@@ -1251,7 +1859,7 @@ describe('Player queue edits', () => {
 		const { player, audio } = await freshPlayer();
 		player.playList([song('a'), song('b')]);
 		await flush();
-		audio.ready();
+		audio.startPlaying();
 		await flush();
 		const standby = FakeAudio.all[1];
 		const url = standby.src;
@@ -1271,28 +1879,15 @@ describe('Player queue edits', () => {
 	});
 
 	it('immediately stops an audible crossfade when its successor is removed', async () => {
-		const resetFade = vi.fn();
-		vi.doMock('./playback/webAudioOutput', () => ({
-			WebAudioOutput: class {
-				attach() {}
-				setVolume() {}
-				setTrim() {}
-				quickFadeIn() {}
-				silenceFade() {}
-				crossfade() {}
-				resetFade = resetFade;
-				trackChanged() {}
-				resume() {}
-				dispose() {}
-			}
-		}));
+		const resetFade = vi.spyOn(FakeWebAudioOutput.prototype, 'resetFade');
+		vi.doMock('./playback/webAudioOutput', () => ({ WebAudioOutput: FakeWebAudioOutput }));
 		localStorage.setItem('music.audio', JSON.stringify({ engine: 'webaudio', crossfade: true }));
 		vi.stubGlobal('fetch', vi.fn(async () => audioResponse()));
 		try {
 			const { player, audio } = await freshPlayer();
 			player.playList([song('a'), song('b'), song('c')]);
 			await flush();
-			audio.ready();
+			audio.startPlaying();
 			await flush();
 			playTo(audio, 194);
 			const standby = FakeAudio.all[1];
@@ -1306,6 +1901,7 @@ describe('Player queue edits', () => {
 			expect(player.current?.id).toBe('a');
 		} finally {
 			vi.doUnmock('./playback/webAudioOutput');
+			resetFade.mockRestore();
 		}
 	});
 

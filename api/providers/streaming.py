@@ -8,7 +8,7 @@ import logging
 import re
 import socket
 import unicodedata
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
@@ -18,8 +18,9 @@ from config import settings
 from errors import SubsonicError
 from models import song_from_spotify, song_from_yt
 import db
+from providers import PlaybackRecording, start_lookup
 from providers.flac_bridge import FlacBridge
-from providers.meta import get_song, remember
+from providers.meta import get_library_song, remember
 from providers.spotapi_client import SpotApiClient
 from providers.ytmusic_stream_service import YTMusicStreamService
 
@@ -168,13 +169,21 @@ class StreamService:
         self._spotify = spotify
         self._ytmusic = ytmusic
         self._flac = flac
+        self._pending_metadata: dict[str, asyncio.Task[dict | None]] = {}
 
     # --- metadata ----------------------------------------------------------
 
-    async def song_meta(self, song_id: str) -> dict | None:
-        cached = get_song(song_id)
+    async def song_meta(self, song_id: str, user_id: str | None = None) -> dict | None:
+        cached = get_library_song(song_id, user_id)
         if cached is not None:
             return cached
+        # Stream and now-playing requests can arrive together for a cold track.
+        task = self._pending_metadata.get(song_id)
+        if task is None:
+            task = start_lookup(self._pending_metadata, song_id, self._fetch_song_meta(song_id))
+        return await asyncio.shield(task)
+
+    async def _fetch_song_meta(self, song_id: str) -> dict | None:
         if song_id.startswith("st-"):
             track_id = song_id[3:]
             if not track_id:
@@ -378,6 +387,7 @@ class StreamService:
         range_header: str | None,
         time_offset: float | None = None,
         fmt: str | None = None,
+        recording: PlaybackRecording | None = None,
     ) -> StreamingResponse:
         format_name = fmt or settings.yt_format
         if time_offset and time_offset > 0:
@@ -395,7 +405,7 @@ class StreamService:
         for attempt in range(3):
             try:
                 chunks, headers, status = await self._ytmusic.proxy_stream(
-                    video_id, range_header=range_header, fmt=format_name
+                    video_id, range_header=range_header, fmt=format_name, recording=recording
                 )
                 break
             except httpx.HTTPStatusError as exc:
@@ -423,9 +433,12 @@ class StreamService:
         time_offset: float | None = None,
         user_agent: str | None = None,
         format: str | None = None,
+        recording: PlaybackRecording | None = None,
     ) -> StreamingResponse:
         effective_fmt = _effective_fmt(format, user_agent)
         yt_kwargs: dict[str, Any] = {}
+        if recording is not None:
+            yt_kwargs["recording"] = recording
         if time_offset is not None:
             yt_kwargs["time_offset"] = time_offset
         if effective_fmt != settings.yt_format:
@@ -443,7 +456,7 @@ class StreamService:
         quality = (
             await db.get_quality(user_id) if user_id else settings.eclipse_quality
         )
-        meta = await self.song_meta(song_id)
+        meta = await self.song_meta(song_id, user_id)
         if meta is None:
             if is_yt:
                 # No metadata means the FLAC bridge cannot be searched; play YouTube.
@@ -479,12 +492,16 @@ class StreamService:
                 if flac.sample_rate:
                     quality_headers["X-Audio-Sample-Rate"] = str(flac.sample_rate)
                 if flac.is_dash or (time_offset and time_offset > 0):
-                    return await self._proxy_ffmpeg(
+                    response = await self._proxy_ffmpeg(
                         flac.url, flac.content_type, quality_headers, time_offset=time_offset
                     )
-                return await self._proxy_direct(
-                    flac.url, range_header, flac.content_type, quality_headers
-                )
+                else:
+                    response = await self._proxy_direct(
+                        flac.url, range_header, flac.content_type, quality_headers
+                    )
+                if recording is not None:
+                    recording.observe(flac.recording_key)
+                return response
             except (httpx.HTTPError, ValueError, SubsonicError, OSError) as exc:
                 logger.warning("flac_bridge: proxy failed, falling back to YT: %s", exc)
         if is_yt:
@@ -525,7 +542,7 @@ class StreamService:
         if not is_yt and not song_id.startswith("st-"):
             raise SubsonicError(70, "Invalid id type")
 
-        meta = await self.song_meta(song_id)
+        meta = await self.song_meta(song_id, user_id)
         if meta is None:
             if is_yt:
                 video_id = song_id[3:]

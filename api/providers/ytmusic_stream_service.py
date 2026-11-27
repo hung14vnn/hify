@@ -28,6 +28,7 @@ from yt_dlp import YoutubeDL
 from ytmusicapi import YTMusic
 
 from config import settings
+from providers import PlaybackRecording
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ class StreamInfo:
     source_title: str = ""  # what YouTube calls the video
     source_artist: str = ""  # YouTube uploader / channel
     size_bytes: int | None = None
+    source_video_id: str = ""  # Preserved when video_id becomes a request/cache alias.
 
     def with_metadata(self, title: str | None, artist: str | None) -> StreamInfo:
         """Return a copy whose title/artist are overridden when given."""
@@ -233,6 +235,7 @@ class _YtDlp:
             size_bytes = None
         return StreamInfo(
             video_id=video_id,
+            source_video_id=str(info.get("id") or video_id),
             title=source_title,
             artist=source_artist,
             duration_s=info.get("duration"),
@@ -793,6 +796,7 @@ class YTMusicStreamService:
         title: str | None = None,
         artist: str | None = None,
         fmt: str = "opus",
+        recording: PlaybackRecording | None = None,
     ) -> tuple[AsyncIterator[bytes], dict[str, str], int]:
         """Proxy the audio bytes for *video_id*.
 
@@ -804,13 +808,13 @@ class YTMusicStreamService:
         requested = _parse_range(range_header)
         if range_header and requested is None:
             # Suffix or multi-part ranges: rare, so pass them through as they are.
-            return await self._proxy_single(info, range_header, fmt)
+            return await self._proxy_single(info, range_header, fmt, recording)
 
         start, end = requested or (0, None)
         first_end = start + _UPSTREAM_RANGE_BYTES - 1
         if end is not None:
             first_end = min(first_end, end)
-        upstream = await self._open_upstream("GET", info, f"bytes={start}-{first_end}", fmt)
+        upstream = await self._open_upstream("GET", info, f"bytes={start}-{first_end}", fmt, recording)
         content_range = _CONTENT_RANGE.match(upstream.headers.get("Content-Range", ""))
         if upstream.status_code != 206 or content_range is None:
             # Upstream ignored the range: what it sent is already the whole answer
@@ -818,7 +822,7 @@ class YTMusicStreamService:
             if range_header is None and upstream.status_code == 200:
                 return _relay(upstream), _pick_headers(upstream.headers, _STREAM_RESPONSE_HEADERS), 200
             await upstream.aclose()
-            return await self._proxy_single(info, range_header, fmt)
+            return await self._proxy_single(info, range_header, fmt, recording)
 
         total = int(content_range.group(3))
         last = total - 1 if end is None else min(end, total - 1)
@@ -848,7 +852,7 @@ class YTMusicStreamService:
                     # 403 is in the cache, not in this closure's `info`.
                     current = await self._resolve(video_id, title, artist, fmt)
                     chunk_end = min(position + _UPSTREAM_RANGE_BYTES - 1, last)
-                    response = await self._open_upstream("GET", current, f"bytes={position}-{chunk_end}", fmt)
+                    response = await self._open_upstream("GET", current, f"bytes={position}-{chunk_end}", fmt, recording)
             finally:
                 if response is not None:
                     await response.aclose()
@@ -856,10 +860,10 @@ class YTMusicStreamService:
         return _chunks(), headers, 206 if range_header is not None else 200
 
     async def _proxy_single(
-        self, info: StreamInfo, range_header: str | None, fmt: str
+        self, info: StreamInfo, range_header: str | None, fmt: str, recording: PlaybackRecording | None
     ) -> tuple[AsyncIterator[bytes], dict[str, str], int]:
         """Relay one upstream request as is (no splitting into ranges)."""
-        upstream = await self._open_upstream("GET", info, range_header, fmt)
+        upstream = await self._open_upstream("GET", info, range_header, fmt, recording)
         return _relay(upstream), _pick_headers(upstream.headers, _STREAM_RESPONSE_HEADERS), upstream.status_code
 
     async def proxy_head(
@@ -899,6 +903,7 @@ class YTMusicStreamService:
         info: StreamInfo,
         range_header: str | None = None,
         fmt: str = "opus",
+        recording: PlaybackRecording | None = None,
     ) -> httpx.Response:
         """Open the upstream audio URL.
 
@@ -939,6 +944,9 @@ class YTMusicStreamService:
                     request=req,
                     response=upstream,
                 )
+            if recording is not None:
+                valid_id = re.fullmatch(r"[A-Za-z0-9_-]{11}", info.source_video_id)
+                recording.observe("yt:" + info.source_video_id if valid_id else None)
             return upstream
 
         raise AssertionError("unreachable")  # pragma: no cover

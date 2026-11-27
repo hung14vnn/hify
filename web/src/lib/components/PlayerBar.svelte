@@ -5,12 +5,13 @@
 	import { songMenu } from "../menus";
 	import { getPlayer } from "../player.svelte";
 	import { href } from "../router.svelte";
-	import { artSwap, pop, textSwap } from "../motion";
+	import { pop, textSwap } from "../motion";
 	import { ui } from "../ui.svelte";
 	import ArtistLinks from "./ArtistLinks.svelte";
 	import Artwork from "./Artwork.svelte";
 	import Icon from "./Icon.svelte";
 	import Slider from "./Slider.svelte";
+	import TrackBlend from "./TrackBlend.svelte";
 
 	const player = getPlayer();
 	const song = $derived(player.current);
@@ -83,21 +84,21 @@
 				aria-label="Open Now Playing"
 				onclick={() => ui.openNowPlaying()}
 			>
-				{#key song.id}
-					<div in:artSwap={{ duration: 360 }}>
+				<TrackBlend>
+					{#snippet children(track)}
 						<Artwork
-							id={song.coverArt}
+							id={track.coverArt}
 							size={64}
-							seed={song.album ?? song.title}
+							seed={track.album ?? track.title}
 						/>
-					</div>
-				{/key}
+					{/snippet}
+				</TrackBlend>
 			</button>
 			<div class="lcd-body">
 				{#key song.id}
 					<div
 						class="lcd-text"
-						in:textSwap={{ dx: 0, duration: 400 }}
+						in:textSwap={{ dx: 5, duration: 220 }}
 					>
 						<span class="lcd-title ellipsis">{song.title}</span>
 						<span class="lcd-sub ellipsis">
@@ -245,14 +246,12 @@
 		color: var(--text-3);
 	}
 	.lcd-art {
+		position: relative;
 		width: 50px;
 		overflow: hidden;
 		flex-shrink: 0;
 		--art-radius: 0;
 		border-radius: 0;
-	}
-	.lcd-art > div {
-		width: 100%;
 	}
 	.lcd-body {
 		flex: 1;

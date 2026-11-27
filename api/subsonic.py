@@ -15,13 +15,14 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 import db
+from providers import PlaybackRecording
 from auth import current_user
 from config import settings
 from errors import SubsonicError
 from lastfm import LastfmService
 from models import album_from_spotify, artist_from_spotify, song_from_spotify, song_from_yt
 from providers.flac_bridge import FlacBridge
-from providers.meta import get_song
+from providers.meta import remember_library_songs
 from providers.spotapi_client import SpotApiClient
 from providers.streaming import StreamService
 from providers.ytmusic_stream_service import YTMusicStreamService
@@ -176,14 +177,30 @@ async def stream(request: Request, user=Depends(current_user)):
             offset_s = max(0.0, float(time_offset))
         except (ValueError, TypeError):
             offset_s = None
-    return await services["stream"].stream(
+    token = request.query_params.get("mixToken") or ""
+    recording = None
+    if request.query_params.get("autoMix") == "1" and not offset_s and re.fullmatch(r"[\w-]{1,96}", token, re.ASCII):
+        recording = PlaybackRecording()
+    response = await services["stream"].stream(
         song_id,
         range_header,
         user["user_id"],
         time_offset=offset_s,
         user_agent=user_agent,
         format=format_param,
+        recording=recording,
     )
+    if recording is not None:
+        services["auto_mix"].observe(user["user_id"], song_id, token, recording, response, range_header)
+    return response
+
+
+@router.get("/getAutoMixInfo")
+async def get_auto_mix_info(request: Request, user=Depends(current_user)) -> JSONResponse:
+    song_id = request.query_params.get("id") or ""
+    token = request.query_params.get("mixToken") or ""
+    info = await _services(request)["auto_mix"].info(user["user_id"], song_id, token)
+    return _ok(autoMixInfo=info)
 
 
 @router.get("/download")
@@ -239,9 +256,9 @@ async def get_lyrics(request: Request, user=Depends(current_user)) -> JSONRespon
 # --- likes ------------------------------------------------------------------
 
 
-async def _fetch_payload(services: dict[str, Any], kind: str, item_id: str) -> dict[str, Any] | None:
+async def _fetch_payload(services: dict[str, Any], kind: str, item_id: str, user_id: str) -> dict[str, Any] | None:
     if kind == "song":
-        return await services["stream"].song_meta(item_id)
+        return await services["stream"].song_meta(item_id, user_id)
     if kind == "artist" and item_id.startswith("sa-"):
         artist = await services["spotify"].get_artist(item_id[3:])
         return artist_from_spotify(artist)
@@ -263,7 +280,7 @@ async def star(request: Request, user=Depends(current_user)) -> JSONResponse:
         for item_id in ids:
             if not item_id:
                 continue
-            payload = await _fetch_payload(services, kind, item_id)
+            payload = await _fetch_payload(services, kind, item_id, user["user_id"])
             if payload is not None:
                 await db.upsert_star(kind, user["user_id"], item_id, payload)
     return _ok()
@@ -286,11 +303,13 @@ async def unstar(request: Request, user=Depends(current_user)) -> JSONResponse:
 @router.get("/getStarred2")
 async def get_starred2(request: Request, user=Depends(current_user)) -> JSONResponse:
     uid = user["user_id"]
+    songs = await db.list_stars("song", uid)
+    remember_library_songs(uid, songs)
     return _ok(
         starred2={
             "artist": await db.list_stars("artist", uid),
             "album": await db.list_stars("album", uid),
-            "song": await db.list_stars("song", uid),
+            "song": songs,
         }
     )
 
@@ -465,6 +484,7 @@ async def recently_played(request: Request, user=Depends(current_user)) -> JSONR
     count = _int(request.query_params.get("count"), 30)
     offset = _int(request.query_params.get("offset"), 0)
     songs = await db.history_list(user["user_id"], count, offset)
+    remember_library_songs(user["user_id"], songs)
     return _ok(recentlyPlayedSongs={"song": songs})
 
 
@@ -611,6 +631,9 @@ def _playlist_json(row: dict[str, Any], entries: list[dict[str, Any]]) -> dict[s
 @router.get("/getPlaylists")
 async def get_playlists(request: Request, user=Depends(current_user)) -> JSONResponse:
     rows = await db.playlists_for(user["user_id"])
+    # Each card has a Play button for its first song. Detail loads the selected list.
+    for row in rows:
+        remember_library_songs(user["user_id"], row["entry"][:1])
     playlists = [_playlist_json(row, row["entry"]) for row in rows]
     return _ok(playlists={"playlist": playlists})
 
@@ -635,6 +658,7 @@ async def get_playlist(request: Request, user=Depends(current_user)) -> JSONResp
     full = await db.playlist(playlist_id, user["user_id"])
     if not full:
         raise SubsonicError(70, "Playlist not found")
+    remember_library_songs(user["user_id"], full["entry"])
     return _ok(playlist=_playlist_json(full, full.get("entry") or []))
 
 
@@ -687,6 +711,7 @@ async def get_play_queue(request: Request, user=Depends(current_user)) -> JSONRe
     queue = await db.get_queue(user["user_id"])
     if not queue:
         return _ok()
+    remember_library_songs(user["user_id"], queue["entry"])
     return _ok(
         playQueue={
             "entry": queue["entry"],
@@ -699,11 +724,9 @@ async def get_play_queue(request: Request, user=Depends(current_user)) -> JSONRe
 @router.get("/savePlayQueue")
 async def save_play_queue(request: Request, user=Depends(current_user)) -> JSONResponse:
     song_ids = request.query_params.getlist("id")
-    songs = [get_song(song_id) for song_id in song_ids]
-    payload = [song for song in songs if song]
     current = request.query_params.get("current")
     position = _float(request.query_params.get("position"), 0.0)
-    await db.save_queue(user["user_id"], payload, current, position)
+    await db.save_queue(user["user_id"], song_ids, current, position)
     return _ok()
 
 
@@ -713,7 +736,7 @@ async def scrobble(request: Request, user=Depends(current_user)) -> JSONResponse
     song_id = request.query_params.get("id") or ""
     submission = _truthy(request.query_params.get("submission"))
     timestamp = _int(request.query_params.get("time"), int(time.time() * 1000)) // 1000
-    song = await services["stream"].song_meta(song_id)
+    song = await services["stream"].song_meta(song_id, user["user_id"])
     if song:
         artist = str(song.get("displayArtist") or song.get("artist") or "")
         title = str(song.get("title") or "")

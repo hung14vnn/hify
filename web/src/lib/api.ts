@@ -282,7 +282,7 @@ function buildUrl(s: Session, endpoint: string, params: Params = {}) {
 import { logApiError } from './playback/debugLog';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function call<T = any>(endpoint: string, params: Params = {}, s: Session | null = session): Promise<T> {
+async function call<T = any>(endpoint: string, params: Params = {}, s: Session | null = session, init?: RequestInit): Promise<T> {
 	if (!s) {
 		const err = new SubsonicError(10, 'Not signed in');
 		logApiError(endpoint, 'Not signed in');
@@ -290,8 +290,9 @@ async function call<T = any>(endpoint: string, params: Params = {}, s: Session |
 	}
 	let res: Response;
 	try {
-		res = await fetch(buildUrl(s, endpoint, params));
+		res = await fetch(buildUrl(s, endpoint, params), init);
 	} catch (e) {
+		if (init?.signal?.aborted) throw e;
 		const msg = e instanceof Error ? e.message : String(e);
 		logApiError(endpoint, 'Fetch failed', msg);
 		throw e;
@@ -300,6 +301,7 @@ async function call<T = any>(endpoint: string, params: Params = {}, s: Session |
 	try {
 		body = await res.json();
 	} catch {
+		if (init?.signal?.aborted) throw init.signal.reason;
 		const msg = `Server returned ${res.status} (not a Subsonic endpoint?)`;
 		logApiError(endpoint, 'Invalid JSON response', msg);
 		throw new SubsonicError(0, msg);
@@ -410,14 +412,31 @@ function isIOS(): boolean {
 	);
 }
 
-export function streamUrl(id: string, bust?: number, timeOffset?: number, format?: string) {
+export function streamUrl(id: string, bust?: number, timeOffset?: number, format?: string, mixToken?: string) {
 	if (!session) return '';
 	const params: Record<string, string | number> = { id };
 	if (bust) params._ = bust;
 	if (timeOffset && timeOffset > 0) params.timeOffset = Math.round(timeOffset * 100) / 100;
+	if (mixToken && !params.timeOffset) {
+		params.autoMix = 1;
+		params.mixToken = mixToken;
+	}
 	const fmt = format ?? (isIOS() ? 'm4a' : undefined);
 	if (fmt) params.format = fmt;
 	return buildUrl(session, 'stream', params);
+}
+
+export interface AutoMixInfo {
+	introSeconds: number;
+	outroSeconds: number;
+}
+
+/** An absent result can become available once the server finishes receiving the stream. */
+export async function getAutoMixInfo(id: string, mixToken: string, signal: AbortSignal): Promise<AutoMixInfo | null> {
+	if (!session || !mixToken) return null;
+	const { autoMixInfo } = await call<{ autoMixInfo?: AutoMixInfo }>('getAutoMixInfo', { id, mixToken }, session, { signal, cache: 'no-store' });
+	return autoMixInfo && Number.isFinite(autoMixInfo.introSeconds) && Number.isFinite(autoMixInfo.outroSeconds)
+		? autoMixInfo : null;
 }
 
 /**

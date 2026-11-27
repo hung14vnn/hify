@@ -5,6 +5,7 @@ import json
 import secrets
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,13 @@ CREATE TABLE IF NOT EXISTS play_history (
     played_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_history_user ON play_history(user_id, played_at DESC);
+
+CREATE TABLE IF NOT EXISTS auto_mix_recordings (
+    recording_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    intro_seconds REAL NOT NULL,
+    outro_seconds REAL NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS play_queue (
     user_id    TEXT PRIMARY KEY,
@@ -156,6 +164,25 @@ def init_db() -> None:
 
 async def _run(fn):  # type: ignore[no-untyped-def]
     return await asyncio.to_thread(fn)
+
+
+def auto_mix_info(recording_id: str, version: int) -> dict[str, float] | None:
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT intro_seconds, outro_seconds FROM auto_mix_recordings WHERE recording_id = ? AND version = ?",
+            (recording_id, version),
+        ).fetchone()
+        return {"introSeconds": row[0], "outroSeconds": row[1]} if row else None
+
+
+def save_auto_mix_info(recording_id: str, version: int, intro: float, outro: float) -> None:
+    with closing(_connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO auto_mix_recordings VALUES (?, ?, ?, ?) ON CONFLICT(recording_id) DO UPDATE SET "
+            "version = excluded.version, intro_seconds = excluded.intro_seconds, outro_seconds = excluded.outro_seconds "
+            "WHERE excluded.version >= auto_mix_recordings.version",
+            (recording_id, version, intro, outro),
+        )
 
 
 # --- sessions ---------------------------------------------------------------
@@ -281,18 +308,18 @@ def _create_playlist(user: dict[str, Any], name: str, song_ids: list[str]) -> st
             (playlist_id, user["user_id"], name, user["username"], now, now),
         )
         if song_ids:
-            _append_items(conn, playlist_id, song_ids, 0)
+            _append_items(conn, user["user_id"], playlist_id, song_ids, 0)
         conn.commit()
     return playlist_id
 
 
 def _append_items(
-    conn: sqlite3.Connection, playlist_id: str, song_ids: list[str], position: int
+    conn: sqlite3.Connection, user_id: str, playlist_id: str, song_ids: list[str], position: int
 ) -> None:
-    from providers.meta import get_song
+    from providers.meta import get_library_song
 
     for song_id in song_ids:
-        payload = get_song(song_id)
+        payload = get_library_song(song_id, user_id)
         if not payload:
             continue
         conn.execute(
@@ -392,7 +419,7 @@ def _update_playlist(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM playlist_items WHERE playlist_id = ?",
                 (playlist_id,),
             ).fetchone()[0]
-            _append_items(conn, playlist_id, add_ids, position)
+            _append_items(conn, user_id, playlist_id, add_ids, position)
         conn.commit()
 
 
@@ -472,8 +499,45 @@ async def history_list(user_id: str, limit: int, offset: int) -> list[dict[str, 
     return await _run(lambda: _history_list(user_id, limit, offset))
 
 
-def _save_queue(user_id: str, songs: list[dict[str, Any]], current: str | None, position: float) -> None:
+def _save_queue(user_id: str, song_ids: list[str], current: str | None, position: float) -> None:
+    from providers.meta import get_library_song, library_song
+
+    known = {song_id: get_library_song(song_id, user_id) for song_id in set(song_ids)}
+    missing = {song_id for song_id, song in known.items() if song is None}
     with _connect() as conn:
+        if missing:
+            # Serialize the read of the prior queue with its replacement. A single JSON
+            # parameter works for queues larger than SQLite's bound-variable limit.
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("""
+                WITH wanted(id) AS (SELECT value FROM json_each(:ids))
+                SELECT json_extract(e.value, '$.id') AS track_id, e.value AS payload
+                  FROM play_queue q, json_each(q.payload) e
+                 WHERE q.user_id = :owner AND e.type = 'object' AND track_id IN wanted
+                UNION ALL
+                SELECT track_id, payload FROM liked_tracks
+                 WHERE user_id = :owner AND track_id IN wanted
+                UNION ALL
+                SELECT i.track_id, i.payload FROM playlists p JOIN playlist_items i ON i.playlist_id = p.id
+                 WHERE p.user_id = :owner AND i.track_id IN wanted
+                UNION ALL
+                SELECT track_id, payload FROM play_history
+                 WHERE user_id = :owner AND track_id IN wanted
+            """, {"owner": user_id, "ids": json.dumps(list(missing))})
+            for track_id, payload in rows:
+                if track_id not in missing:
+                    continue
+                try:
+                    song = library_song(json.loads(payload))
+                except (ValueError, TypeError):
+                    continue
+                if song and song["id"] == track_id:
+                    known[track_id] = song
+                    missing.remove(track_id)
+                if not missing:
+                    break
+            rows.close()
+        songs = [known[song_id] for song_id in song_ids if known[song_id] is not None]
         conn.execute(
             "INSERT OR REPLACE INTO play_queue (user_id, payload, current, position, updated_at)"
             " VALUES (?, ?, ?, ?, ?)",
@@ -488,8 +552,8 @@ def _save_queue(user_id: str, songs: list[dict[str, Any]], current: str | None, 
         conn.commit()
 
 
-async def save_queue(user_id: str, songs: list[dict[str, Any]], current: str | None, position: float) -> None:
-    await _run(lambda: _save_queue(user_id, songs, current, position))
+async def save_queue(user_id: str, song_ids: list[str], current: str | None, position: float) -> None:
+    await _run(lambda: _save_queue(user_id, song_ids, current, position))
 
 
 def _get_queue(user_id: str) -> dict[str, Any] | None:

@@ -4,19 +4,21 @@
 	// (lyrics · output device · queue). Lyrics/queue sit beside the art on desktop
 	// and replace it on phones.
 	import { tick } from "svelte";
+	import { browser } from "$app/environment";
 	import { cubicOut } from "svelte/easing";
 	import { time } from "../format";
 	import { toggleKaraoke } from "../karaoke";
 	import { songMenu } from "../menus";
 	import type { TransitionConfig } from "svelte/transition";
-	import { artSwap, fadeOnly, pop, sheet, textSwap } from "../motion";
+	import { fadeOnly, pop, sheet, textSwap } from "../motion";
 	import { coverUrl, getPlaybackQuality, setPlaybackQuality, type PlaybackQuality } from "../api";
-	import { artworkTint, type Tint } from "../palette";
+	import { artworkTint } from "../palette";
 	import { getPlayer } from "../player.svelte";
 	import { sleepTimer } from "../sleepTimer.svelte";
 	import { audioSettings } from "../playback/audioSettings.svelte";
 	import { ui } from "../ui.svelte";
 	import Artwork from "./Artwork.svelte";
+	import TrackBlend from "./TrackBlend.svelte";
 	import ArtistLinks from "./ArtistLinks.svelte";
 	import Icon from "./Icon.svelte";
 	import Lyrics from "./Lyrics.svelte";
@@ -25,7 +27,7 @@
 
 	const player = getPlayer();
 	const song = $derived(player.current);
-	const nextSong = $derived(player.nextSong);
+	const mix = $derived(player.transition);
 	let scrub = $state<number | null>(null);
 	const shownTime = $derived(scrub ?? player.currentTime);
 	// Whole seconds: the bar moves ~1px/s, so repainting on every timeupdate (~4/s) is wasted.
@@ -38,128 +40,16 @@
 		time(Math.max(0, Math.floor(trackDuration - shownTime))),
 	);
 
-	interface DisplayTrack {
-		id: string;
-		coverArt?: string;
-		title?: string;
-		artist?: string;
-		album?: string;
-		tint: Tint | null;
-	}
-
-	let currentDisplay = $state<DisplayTrack | null>(null);
-	let incomingDisplay = $state<DisplayTrack | null>(null);
-	let incomingActive = $state(false);
-
-	let tint: Tint | null = $state(null);
-	let nextTint: Tint | null = $state(null);
 	let npHeight = $state(0);
 	let controlsVisible = $state(true);
-	/** Set by close(): the backdrop must not fade out underneath the morph. */
-	let closing = false;
 	let controlsTimer: ReturnType<typeof setTimeout> | undefined;
 	let wakeLock: WakeLockSentinel | null = null;
 
+	// Prime the next cover palette before the audio overlap starts.
 	$effect(() => {
-		const art = song?.coverArt;
-		let cancelled = false;
-		Promise.resolve(artworkTint(art)).then((t) => {
-			if (!cancelled) {
-				tint = t;
-				if (currentDisplay && currentDisplay.id === song?.id) {
-					currentDisplay.tint = t;
-				}
-			}
-		});
-		return () => (cancelled = true);
+		const art = player.nextSong?.coverArt;
+		if (art) void artworkTint(art);
 	});
-
-	$effect(() => {
-		const art = nextSong?.coverArt;
-		let cancelled = false;
-		if (art) {
-			Promise.resolve(artworkTint(art)).then((t) => {
-				if (!cancelled) {
-					nextTint = t;
-					if (incomingDisplay && incomingDisplay.id === nextSong?.id) {
-						incomingDisplay.tint = t;
-					}
-				}
-			});
-		} else {
-			nextTint = null;
-		}
-		return () => (cancelled = true);
-	});
-
-	// Smooth track transition management
-	$effect(() => {
-		const cur = song;
-		if (!cur) {
-			currentDisplay = null;
-			incomingDisplay = null;
-			return;
-		}
-
-		if (!currentDisplay || cur.id !== currentDisplay.id) {
-			if (incomingDisplay && incomingDisplay.id === cur.id) {
-				// Seamless handoff from audio crossfade
-				currentDisplay = incomingDisplay;
-				incomingDisplay = null;
-				incomingActive = false;
-			} else {
-				// Smooth cross-dissolve & artSwap transition triggered via key
-				currentDisplay = {
-					id: cur.id,
-					coverArt: cur.coverArt,
-					title: cur.title,
-					artist: cur.artist,
-					album: cur.album,
-					tint
-				};
-			}
-		} else if (currentDisplay.id === cur.id && !currentDisplay.coverArt && cur.coverArt) {
-			currentDisplay.coverArt = cur.coverArt;
-		}
-	});
-
-	// Audio crossfade reactive controller
-	$effect(() => {
-		const isCf = player.crossfading;
-		const nxt = player.nextSong;
-
-		if (isCf && nxt) {
-			incomingDisplay = {
-				id: nxt.id,
-				coverArt: nxt.coverArt,
-				title: nxt.title,
-				artist: nxt.artist,
-				album: nxt.album,
-				tint: nextTint
-			};
-			requestAnimationFrame(() => {
-				requestAnimationFrame(() => {
-					incomingActive = true;
-				});
-			});
-		} else if (!isCf && incomingDisplay) {
-			if (incomingDisplay.id !== song?.id) {
-				incomingActive = false;
-				const timer = setTimeout(() => {
-					if (!player.crossfading) {
-						incomingDisplay = null;
-					}
-				}, 500);
-				return () => clearTimeout(timer);
-			}
-		}
-	});
-
-	const displayTint = $derived(
-		incomingActive && incomingDisplay?.tint
-			? incomingDisplay.tint
-			: currentDisplay?.tint ?? tint
-	);
 
 	const LOSSLESS = new Set([
 		"flac",
@@ -620,13 +510,7 @@
 	}
 
 	function close() {
-		closing = true;
 		ui.closeNowPlaying();
-	}
-
-	/** The backdrop fades between tracks, but never while the sheet closes. */
-	function backdropOut(node: Element, opts?: { duration?: number }) {
-		return fadeOnly(node, { duration: closing ? 0 : (opts?.duration ?? 450) });
 	}
 
 	// ---- open/close morph ------------------------------------------------------
@@ -670,7 +554,7 @@
 			morphDir = dir;
 			// The outward morph must not keep the tinted sheet over the pill: switch
 			// the sheet to the mini player's default colour from its first frame.
-			if (dir === "out") node.classList.add("closing");
+			node.classList.toggle("closing", dir === "out");
 
 			// Reversed mid-flight: turn the running animations around so they continue
 			// from where they are and land when Svelte's (shortened) timer does.
@@ -728,13 +612,14 @@
 			// Artwork: the cover flies between the mini player's thumbnail and the
 			// hero box, so both directions read as the same image moving.
 			// With a panel open (portrait) the big image is hidden; the thumbnail flies instead.
-			const hero = node.querySelector<HTMLElement>(
+			const heroes = node.querySelectorAll<HTMLElement>(
 				mobileOpen && isPortrait ? ".art-row .art-wrap" : ".backdrop-art",
 			);
 			const from = document
 				.querySelector<HTMLElement>("[data-np-art]")
 				?.getBoundingClientRect();
-			if (hero && from?.width) {
+			for (const hero of heroes) {
+				if (!from?.width) break;
 				const to = hero.getBoundingClientRect();
 				if (to.width > 1 && to.height > 1) {
 					const sx = from.width / to.width;
@@ -941,11 +826,8 @@
 <div
 	transition:morph
 	class="np"
-	class:tinted={!!displayTint}
 	class:closing={!ui.nowPlaying}
 	class:panel-open={mobileOpen}
-	style:--np-top={displayTint?.top}
-	style:--np-bottom={displayTint?.bottom}
 	style:--np-h="{npHeight}px"
 	bind:clientHeight={npHeight}
 	style:transform={dragY ? `translateY(${dragY}px)` : undefined}
@@ -961,65 +843,31 @@
 	aria-label="Now Playing"
 >
 	<div class="backdrop" bind:this={backdropEl} aria-hidden="true">
-		{#if currentDisplay}
-			{#key currentDisplay.id}
-				<div class="backdrop-layer active" out:backdropOut={{ duration: 450 }}>
-					{#if currentDisplay.tint}
+		<TrackBlend>
+			{#snippet children(track)}
+				<div class="backdrop-art">
+					<Artwork src={coverUrl(track.coverArt, 1200)} size={600} seed={track.album ?? track.title} priority />
+				</div>
+				{#await (browser ? artworkTint(track.coverArt) : null) then tint}
+					{#if tint}
 						<div
 							class="tint-flat"
-							style:--top={currentDisplay.tint.top}
-							style:--bottom={currentDisplay.tint.bottom}
+							style:--top={tint.ambient ?? tint.top}
+							style:--bottom={tint.bottom}
 						></div>
-					{/if}
-					<img
-						class="backdrop-art"
-						src={coverUrl(currentDisplay.coverArt, 1200)}
-						alt=""
-						draggable="false"
-					/>
-					{#if currentDisplay.tint}
 						<div
 							class="tint"
-							style:--top={currentDisplay.tint.top}
-							style:--bottom={currentDisplay.tint.bottom}
-							style:--accent={currentDisplay.tint.accent ?? currentDisplay.tint.top}
-							style:--glow={currentDisplay.tint.glow ?? 'transparent'}
+							style:--top={tint.ambient ?? tint.top}
+							style:--bottom={tint.bottom}
+							style:--glow={tint.glow ?? "transparent"}
+							in:fadeOnly={{ duration: 180 }}
 						>
-							<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
+							<div class="mesh-aura" class:paused={!player.playing || mobileOpen}></div>
 						</div>
 					{/if}
-				</div>
-			{/key}
-		{/if}
-
-		{#if incomingDisplay}
-			<div class="backdrop-layer incoming" class:fading-in={incomingActive}>
-				{#if incomingDisplay.tint}
-					<div
-						class="tint-flat"
-						style:--top={incomingDisplay.tint.top}
-						style:--bottom={incomingDisplay.tint.bottom}
-					></div>
-				{/if}
-				<img
-					class="backdrop-art"
-					src={coverUrl(incomingDisplay.coverArt, 1200)}
-					alt=""
-					draggable="false"
-				/>
-				{#if incomingDisplay.tint}
-					<div
-						class="tint"
-						style:--top={incomingDisplay.tint.top}
-						style:--bottom={incomingDisplay.tint.bottom}
-						style:--accent={incomingDisplay.tint.accent ?? incomingDisplay.tint.top}
-						style:--glow={incomingDisplay.tint.glow ?? 'transparent'}
-					>
-						<div class="mesh-aura" class:paused={!player.playing || mobileOpen} aria-hidden="true"></div>
-					</div>
-				{/if}
-			</div>
-		{/if}
+				{/await}
+			{/snippet}
+		</TrackBlend>
 	</div>
 
 	<div class="panel-veil" class:visible={mobileOpen} aria-hidden="true"></div>
@@ -1119,8 +967,8 @@
 						</span>
 					</div>
 					<div class="spec-card">
-						<span class="spec-label">Crossfade</span>
-						<span class="spec-val">{audioSettings.crossfade ? '8s Blend' : 'Disabled'}</span>
+						<span class="spec-label">Song Transitions</span>
+						<span class="spec-val">{player.webAudio && audioSettings.crossfade ? (audioSettings.autoMix ? 'AutoMix' : 'Crossfade') : 'Off'}</span>
 					</div>
 				</div>
 
@@ -1173,43 +1021,21 @@
 					<div class="art-wrap" data-flip="art">
 						<div class="art" class:paused={!player.playing}>
 							<div class="art-layers">
-								{#if currentDisplay}
-									{#key currentDisplay.id}
-										<div
-											class="art-layer active"
-											in:artSwap={{ duration: 420 }}
-											out:fadeOnly={{ duration: 320 }}
-										>
-											<Artwork
-												id={currentDisplay.coverArt}
-												size={600}
-												seed={currentDisplay.album ?? currentDisplay.title}
-												priority
-											/>
-										</div>
-									{/key}
-								{/if}
-
-								{#if incomingDisplay}
-									<div class="art-layer incoming" class:fading-in={incomingActive}>
-										<Artwork
-											id={incomingDisplay.coverArt}
-											size={600}
-											seed={incomingDisplay.album ?? incomingDisplay.title}
-											priority
-										/>
-									</div>
-								{/if}
+								<TrackBlend>
+									{#snippet children(track)}
+										<Artwork id={track.coverArt} size={600} seed={track.album ?? track.title} priority />
+									{/snippet}
+								</TrackBlend>
 							</div>
 						</div>
 					</div>
 					<div class="meta" inert={!mobileOpen ? true : undefined}>
-						<span class="c-title ellipsis">{song.title}</span>
-						<ArtistLinks
-							class="c-artist ellipsis"
-							item={song}
-							onclick={close}
-						/>
+						{#key song.id}
+							<div class="compact-caption" in:textSwap={{ dx: 5, duration: 220 }}>
+								<span class="c-title ellipsis">{song.title}</span>
+								<ArtistLinks class="c-artist ellipsis" item={song} onclick={close} />
+							</div>
+						{/key}
 					</div>
 					<button
 						class="round meta-btn"
@@ -1256,22 +1082,22 @@
 							in:fadeOnly={{ duration: 260 }}
 						>
 							<div class="text-stage">
-								{#key song.id}
+								{#each [song] as track (track.id)}
 									<div
 										class="text"
-										in:fadeOnly={{ duration: 240 }}
-										out:fadeOnly={{ duration: 180 }}
+										in:textSwap={{ dx: 7, duration: 260 }}
+										out:fadeOnly={{ duration: 120 }}
 									>
 										<span class="title ellipsis"
-											>{song.title}</span
+											>{track.title}</span
 										>
 										<ArtistLinks
 											class="artist ellipsis"
-											item={song}
+											item={track}
 											onclick={close}
 										/>
 									</div>
-								{/key}
+								{/each}
 							</div>
 							<button
 								class="round"
@@ -1352,7 +1178,7 @@
 											? sleepTimer.remainingLabel
 											: "End of Track"}
 									</button>
-								{:else if player.crossfading}
+								{:else if mix}
 									<span
 										class="fade-notice"
 										in:fadeOnly={{ duration: 200 }}
@@ -1360,7 +1186,7 @@
 									>
 										<Icon name="crossfade" size={11} />
 										<span class="fade-notice-text">
-											Fading into {player.nextSong?.title ? `“${player.nextSong.title}”` : "next track"}
+											{mix.autoMix ? "Mixing" : "Fading"} into “{mix.song.title}”
 										</span>
 									</span>
 								{:else if qualityBadgeLabel}
@@ -1540,16 +1366,6 @@
 		contain: strict;
 		overflow: hidden;
 	}
-	.backdrop-layer {
-		position: absolute;
-		inset: 0;
-		overflow: hidden;
-		pointer-events: none;
-	}
-	.backdrop-layer.active {
-		z-index: 1;
-		opacity: 1;
-	}
 	.panel-veil {
 		position: absolute;
 		inset: 0;
@@ -1562,26 +1378,20 @@
 	.panel-veil.visible {
 		opacity: 1;
 	}
-	.backdrop-layer.incoming {
-		z-index: 2;
-		opacity: 0;
-		transition: opacity 6.5s cubic-bezier(0.4, 0, 0.2, 1);
-		will-change: opacity;
-	}
-	.backdrop-layer.incoming.fading-in {
-		opacity: 1;
-	}
 	.backdrop-art {
 		position: absolute;
 		inset: -4%;
 		width: 108%;
 		height: 108%;
 		z-index: 0;
-		object-fit: cover;
-		object-position: center;
+		--art-radius: 0;
+		--art-shadow: none;
 		filter: saturate(1.08);
 		pointer-events: none;
 		user-select: none;
+	}
+	.backdrop-art :global(.art) {
+		height: 100%;
 	}
 	.tint {
 		position: absolute;
@@ -1795,27 +1605,6 @@
 		aspect-ratio: 1;
 		border-radius: var(--art-radius, 14px);
 	}
-	.art-layer {
-		position: absolute;
-		inset: 0;
-		width: 100%;
-		height: 100%;
-		border-radius: var(--art-radius, 14px);
-		overflow: hidden;
-	}
-	.art-layer.active {
-		z-index: 1;
-		opacity: 1;
-	}
-	.art-layer.incoming {
-		z-index: 2;
-		opacity: 0;
-		transition: opacity 6.5s cubic-bezier(0.4, 0, 0.2, 1);
-		will-change: opacity;
-	}
-	.art-layer.incoming.fading-in {
-		opacity: 1;
-	}
 	/* On mobile, the row also carries the compact title/buttons — collapsed to
 	   zero width (and hidden) whenever the art is at full size, since the art
 	   itself already claims all the row's width at that point. */
@@ -1827,6 +1616,11 @@
 		flex-direction: column;
 		opacity: 0;
 		transition: opacity 0.2s ease;
+	}
+	.compact-caption {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
 	}
 	.meta-btn {
 		transition: opacity 0.2s ease;
@@ -2489,7 +2283,6 @@
 			inset: 0 0 auto 0;
 			width: 100%;
 			height: 52vh;
-			object-position: center;
 			-webkit-mask-image: linear-gradient(
 				to bottom,
 				#000 0%,

@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 
 import auth
 import db
+from auto_mix import AutoMix
 from config import BASE_DIR, settings
 from errors import SubsonicError
 from lastfm import LastfmService
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
     spotify = SpotApiClient()
     ytmusic = YTMusicStreamService(http)
     flac = FlacBridge(http)
+    auto_mix = AutoMix()
     asyncio.create_task(flac.warm_manifests())
     app.state.services = {
         "http": http,
@@ -49,6 +51,7 @@ async def lifespan(app: FastAPI):
         "ytmusic": ytmusic,
         "flac": flac,
         "stream": StreamService(http, spotify, ytmusic, flac),
+        "auto_mix": auto_mix,
         "lastfm": LastfmService(http),
     }
     logger.info(
@@ -62,6 +65,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await auto_mix.close()
         await http.aclose()
 
 

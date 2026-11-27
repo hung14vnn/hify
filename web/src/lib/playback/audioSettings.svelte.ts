@@ -21,6 +21,7 @@ interface Stored {
 	enhancer?: boolean;
 	enhancerLevel?: number;
 	crossfade?: boolean;
+	autoMix?: boolean;
 	soundCheck?: boolean;
 }
 
@@ -47,6 +48,8 @@ class AudioSettings {
 	enhancerLevel = $state(0.5);
 	/** Crossfade (Web Audio): each song fades into the next when it ends by itself. */
 	crossfade = $state(false);
+	/** Use analyzed intro/outro lengths when crossfading. */
+	autoMix = $state(false);
 	/** Sound Check (Web Audio): ReplayGain, so songs play at about the same loudness. */
 	soundCheck = $state(false);
 	/** The engine this page load's player was built with. */
@@ -63,6 +66,7 @@ class AudioSettings {
 		this.enhancer = s.enhancer === true;
 		if (typeof s.enhancerLevel === 'number') this.enhancerLevel = clampLevel(s.enhancerLevel);
 		this.crossfade = s.crossfade === true;
+		this.autoMix = this.crossfade && s.autoMix === true;
 		this.soundCheck = s.soundCheck === true;
 		this.activeEngine = this.engine;
 		// Leaving (or a restart onto the new engine) mustn't drop a pending save.
@@ -110,10 +114,16 @@ class AudioSettings {
 		this.changed();
 	}
 
-	/** Read at each track change; nothing to apply now. */
 	setCrossfade(on: boolean) {
 		this.crossfade = on;
-		this.save();
+		if (!on) this.autoMix = false;
+		this.changed();
+	}
+
+	setAutoMix(on: boolean) {
+		this.autoMix = on;
+		if (on) this.crossfade = true;
+		this.changed();
 	}
 
 	setSoundCheck(on: boolean) {
@@ -149,6 +159,7 @@ class AudioSettings {
 				enhancer: this.enhancer,
 				enhancerLevel: this.enhancerLevel,
 				crossfade: this.crossfade,
+				autoMix: this.autoMix,
 				soundCheck: this.soundCheck
 			};
 			localStorage.setItem(STORAGE_KEY, JSON.stringify(stored));

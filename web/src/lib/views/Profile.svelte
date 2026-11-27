@@ -50,6 +50,18 @@
     ["element", "Standard"],
     ["webaudio", "Web Audio (Beta)"],
   ];
+  const transitionModes = ["Off", "Crossfade", "AutoMix"] as const;
+  const transitionMode = $derived(
+    !player.webAudio || !audioSettings.crossfade ? "Off" : audioSettings.autoMix ? "AutoMix" : "Crossfade",
+  );
+
+  function selectTransition(mode: (typeof transitionModes)[number]) {
+    if (mode === "AutoMix") audioSettings.setAutoMix(true);
+    else {
+      audioSettings.setAutoMix(false);
+      audioSettings.setCrossfade(mode === "Crossfade");
+    }
+  }
 
   let lastfm = $state<LastfmStatus | null>(null);
   let lastfmError = $state("");
@@ -516,6 +528,36 @@
         >
       </div>
     {/if}
+    <div class="row engine" style="border-top: 0.5px solid var(--hairline);">
+      <span class="icon-box" style="background: var(--accent);"
+        ><Icon name="crossfade" size={18} /></span
+      >
+      <div class="text">
+        <span class="label">Song Transitions</span>
+        <span class="detail" id="transition-detail">
+          {#if player.webAudio}
+            AutoMix matches the blend to each pair of songs.
+          {:else}
+            Requires the Web Audio engine
+          {/if}
+        </span>
+      </div>
+      <div class="segmented" role="radiogroup" aria-label="Song Transitions" aria-describedby="transition-detail">
+        {#each transitionModes as mode}
+          <label class:on={transitionMode === mode}>
+            <input
+              type="radio"
+              name="song-transition"
+              value={mode}
+              checked={transitionMode === mode}
+              disabled={!player.webAudio}
+              onchange={() => selectTransition(mode)}
+            />
+            {mode}
+          </label>
+        {/each}
+      </div>
+    </div>
     <a
       class="row link"
       href="#/equalizer"
@@ -1148,7 +1190,7 @@
     border-radius: 999px;
     background: var(--fill);
   }
-  .segmented button {
+  .segmented :is(button, label) {
     height: 28px;
     padding: 0 12px;
     border-radius: 999px;
@@ -1160,11 +1202,34 @@
       background-color 0.2s ease,
       box-shadow 0.2s ease;
   }
+  .segmented label {
+    position: relative;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+  .segmented label input {
+    position: absolute;
+    inset: 0;
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: inherit;
+  }
+  .segmented label:has(input:focus-visible) {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  .segmented label:has(input:disabled) {
+    opacity: 0.55;
+    cursor: default;
+  }
   /* A segmented control just moves its selection; no press-down like other buttons. */
   .segmented button:active {
     transform: none;
   }
-  .segmented button.on {
+  .segmented .on {
     /* iOS: white on light, a lighter grey than the track on dark */
     background: #fff;
     box-shadow:
@@ -1172,7 +1237,7 @@
       0 0 0 0.5px rgb(0 0 0 / 0.04);
   }
   @media (prefers-color-scheme: dark) {
-    .segmented button.on {
+    .segmented .on {
       background: #636366;
     }
   }
@@ -1185,7 +1250,7 @@
       flex: 1 0 calc(100% - 44px);
       margin-left: 44px;
     }
-    .row.engine .segmented button {
+    .row.engine .segmented :is(button, label) {
       flex: 1;
     }
   }

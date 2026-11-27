@@ -76,6 +76,7 @@
 	// Songs removed from the library are hidden in place: rows keep their index in
 	// `songs`, which `onplay`/`extraMenu` callers (e.g. playlist removal) rely on.
 	function play(i: number) {
+		clearTimeout(warmTimer);
 		if (onplay) return onplay(i);
 		if (!ui.removedSongs.size) return player.playList(songs, i);
 		const before = songs.slice(0, i).filter((s) => ui.removedSongs.has(s.id)).length;
@@ -93,7 +94,7 @@
 		// A row the pointer merely passes through should not cost an add-on call.
 		clearTimeout(warmTimer);
 		warmTimer = setTimeout(() => {
-			if (warmed.has(id)) return;
+			if (warmed.has(id) || player.current?.id === id) return;
 			warmed.add(id);
 			void warmTrack(id);
 		}, 180);
@@ -160,8 +161,8 @@
 			class="row"
 			class:current
 			role="listitem"
-			onpointerenter={() => warm(song.id)}
-			onfocus={() => warm(song.id)}
+			onpointerenter={(e) => { if (e.pointerType !== 'touch') warm(song.id); }}
+			onfocusin={(e) => { if ((e.target as HTMLElement).matches(':focus-visible')) warm(song.id); }}
 			ondblclick={selectionMode ? undefined : () => play(i)}
 			oncontextmenu={(e) => {
 				// While a hold is in progress the browser's own long-press menu must not appear.

@@ -2,6 +2,7 @@ import { getAlbum, getKaraoke, getPlayQueue, getSession, releaseKaraoke, savePla
 import { build, buildLabel } from './build';
 import { isPlaybackLogEnabled, logPlayback } from './playback/debugLog';
 import { audioSettings } from './playback/audioSettings.svelte';
+import { AutoMixPair, type MixSource } from './playback/autoMix';
 import { isLossless, type EnhancerSource } from './playback/cutoffDetector';
 import { InterruptionGuard } from './playback/interruptions';
 import { clearMediaSession, setMediaMetadata, setMediaPosition, setupMediaSession } from './playback/mediaSession';
@@ -26,7 +27,6 @@ import type { Song } from './types';
 
 export type { Repeat };
 
-/** The codec actually being served, learned from the stream's Content-Type. */
 /**
  * Streams the browser can't byte-seek (lossless remuxes, Spotify bridges): a seek
  * re-requests the stream with `timeOffset` instead of setting currentTime.
@@ -68,23 +68,30 @@ function suffixFromContentType(value: string | null): string {
 	return '';
 }
 
+function applyStreamFormat(song: Song, headers: Headers) {
+	const suffix = suffixFromContentType(headers.get('content-type'));
+	const depth = Number(headers.get('x-audio-bit-depth'));
+	const rate = Number(headers.get('x-audio-sample-rate'));
+	if (suffix) song.suffix = suffix;
+	if (Number.isSafeInteger(depth) && depth > 0) song.bitDepth = depth;
+	if (Number.isSafeInteger(rate) && rate > 0) song.sampleRate = rate;
+}
+
 interface ObjectUrl {
 	url: string;
 	revoke: () => void;
 }
 
 /** A downloaded (or fully prefetched) track's blob URL, tagged with the song it plays. */
-interface OfflineCopy {
-	id: string;
+interface OfflineCopy extends MixSource {
 	copy: ObjectUrl;
-	prefetched?: boolean;
 }
 
 interface NextPreparation {
 	id: string;
 	/** Transferred to load() if this track starts before the local read finishes. */
 	lookup: Promise<ObjectUrl | null> | null;
-	warm: AbortController;
+	warm: AbortController | null;
 }
 
 interface BlobJob {
@@ -189,6 +196,8 @@ const DURATION_MISMATCH_RATIO = 1.25;
  * current one, so some element is playing at every moment (see `swapToStandby`).
  */
 const HANDOFF_LEAD_S = 0.6;
+/** Hidden Android pages may receive fewer timeupdates while the screen is locked. */
+const ANDROID_HIDDEN_HANDOFF_LEAD_S = 1;
 
 /**
  * Crossfade (Web Audio): the next song starts this long before the end, and the two
@@ -333,12 +342,16 @@ class Player {
 	/** When the current element last fired `playing`. */
 	private playingSince = -Infinity;
 	/** Non-iOS: next track whose stream (not a downloaded copy) goes into the standby element. */
-	private standbyStreamId: string | null = null;
+	private standbyStream: (MixSource & { url: string }) | null = null;
+	private playingSource: MixSource | null = null;
+	private readonly mixPair = new AutoMixPair();
 	private unshuffled: Song[] | null = null;
 	private scrobbled = false;
 	private pendingSeek = 0;
 	/** Invalidates a load still waiting on the offline lookup when another one starts. */
 	private loadToken = 0;
+	/** Set on first playback of this load; aborts its codec request on a track or quality change. */
+	private startedSource: AbortController | null = null;
 	/** Invalidates a karaoke start/poll loop that was turned off or followed another track. */
 	private karaokeRun = 0;
 	/** Server session keeping this song's stems in its memory while we play them. */
@@ -406,8 +419,9 @@ class Player {
 	 * this one (`fading` once its fade-in has begun).
 	 */
 	private preroll: { el: HTMLAudioElement; listeners: AbortController; fading: boolean } | null = null;
-	/** Whether the player is currently crossfading between tracks. */
-	crossfading = $state(false);
+	/** The audible overlap. startedAt uses performance.now(), duration is in seconds. */
+	transition = $state.raw<{ song: Song; startedAt: number; duration: number; autoMix: boolean } | null>(null);
+	crossfading = $derived(this.transition !== null);
 
 	constructor() {
 		// Marks where each page load starts in the log, and which build it ran.
@@ -429,7 +443,12 @@ class Player {
 
 		this.stopDiagnostics = this.startDiagnostics();
 		// Sound Check switched mid-song: apply it to the song playing.
-		if (this.output) this.stopAudioSettings = audioSettings.onChange(() => this.applyReplayGain(true));
+		if (this.output) this.stopAudioSettings = audioSettings.onChange(() => {
+			this.applyReplayGain(true);
+			if (!audioSettings.crossfade) this.cancelPreroll();
+			if (!this.autoMixEnabled) this.mixPair.clear();
+			else this.prepareMix();
+		});
 
 		window.addEventListener('pagehide', this.onPageHide);
 		document.addEventListener('visibilitychange', this.onVisibilityChange);
@@ -528,12 +547,13 @@ class Player {
 			this.errorSkips = 0;
 			this.errorOriginIndex = -1;
 			this.watchFrozen(a);
+			this.onPlaybackStarted();
 		});
 		a.addEventListener('canplay', () => {
 			if (this.audio !== a) return;
 			this.buffering = false;
 			if (this.playRequested && a.paused) this.play();
-			if (this.playRequested && !this.switching) this.prefetchInWindow();
+			this.prepareNextStream();
 		});
 		a.addEventListener('loadedmetadata', () => {
 			if (this.audio !== a) return;
@@ -667,6 +687,7 @@ class Player {
 
 	private queueChanged() {
 		this.prepareNext();
+		this.prepareMix();
 		this.persist();
 	}
 
@@ -794,7 +815,14 @@ class Player {
 		// A fresh request: its own failure must reach onError even if an earlier
 		// one of this load was already handled.
 		this.errorHandledToken = -1;
-		this.audio.src = streamUrl(song.id, ++this.streamBust, seconds);
+		const source = this.fullStream(song, ++this.streamBust, seconds);
+		this.playingSource = source;
+		if (source.mixToken) {
+			this.startedSource?.abort();
+			this.startedSource = null;
+		}
+		this.mixPair.clear();
+		this.audio.src = source.url;
 		this.audio.load();
 	}
 
@@ -1035,6 +1063,13 @@ class Player {
 		// A handoff still finishing ends with the next change.
 		if (this.retiring) this.finishRetire(this.retiring.el);
 		const token = ++this.loadToken;
+		this.startedSource?.abort();
+		this.startedSource = null;
+		this.playingSource = null;
+		this.mixPair.clear();
+		// A new playlist can keep the same successor. Drop its in-flight network work,
+		// while retaining any ready copy or pending local lookup.
+		if (!incoming && this.preparation && !this.preparation.lookup && !this.nextReady) this.clearPreparation();
 		this.index = i;
 		this.androidStartTime = null;
 		this.error = null;
@@ -1105,8 +1140,12 @@ class Player {
 		this.streamOffsetUnverified = this.streamOffset > 0;
 		// The server already starts the stream at startAt: don't seek again on metadata.
 		if (this.streamOffset) this.pendingSeek = 0;
-		const src = offline?.copy.url ?? streamUrl(song.id, song.karaokeOf ? this.karaokeBust : 0, this.streamOffset);
-		const handoff = wantsPlayback && startAt === 0 && this.standbyHolds(src);
+		const prepared = offline ? { id: song.id, url: offline.copy.url, mixToken: offline.mixToken, prefetched: offline.prefetched }
+			: this.standbyStream?.id === song.id ? this.standbyStream : null;
+		const handoff = wantsPlayback && startAt === 0 && !!prepared && this.standbyHolds(prepared.url);
+		const source = prepared && (handoff || offline) ? prepared
+			: this.fullStream(song, song.karaokeOf ? this.karaokeBust : 0, this.streamOffset);
+		this.playingSource = source;
 
 		logPlayback(
 			'load',
@@ -1122,13 +1161,12 @@ class Player {
 			this.output?.quickFadeIn(this.audio, 0.22);
 			this.audio.autoplay = wantsPlayback;
 			this.applyVolume(this.audio);
-			this.audio.src = src;
+			this.audio.src = source.url;
 			this.audio.load();
 			if (startAt > 0 && !serverSeek) this.audio.currentTime = startAt;
 		}
 		this.output?.trackChanged(isLossless(song));
 		this.applyReplayGain();
-		void this.learnCodec(song, Boolean(offline));
 		if (wantsPlayback) {
 			if (this.android) this.androidStartTime = this.audio.currentTime;
 			// Unlike Navidrome, play() right away rather than waiting for `canplay`: a cold
@@ -1147,14 +1185,43 @@ class Player {
 	 * keeps to the single element that got the user's tap.
 	 */
 	private standbyAllowed(): boolean {
-		return !this.ios || !!this.preroll || (this.crossfadeFor(Infinity) > 0 && !document.hidden);
+		return !this.ios || !!this.preroll || (!!this.output && audioSettings.crossfade && !sleepTimer.isEndOfTrack && !document.hidden);
 	}
 
-	/** Seconds to crossfade a song of `dur` seconds into the next one; 0 to cut. */
-	private crossfadeFor(dur: number): number {
-		// An end-of-track sleep timer stops at the very end, so no early handoff.
-		if (!this.output || !audioSettings.crossfade || sleepTimer.isEndOfTrack) return 0;
-		return dur >= CROSSFADE_S * 3 ? CROSSFADE_S : 0;
+	private get autoMixEnabled(): boolean {
+		return !!this.output && audioSettings.crossfade && audioSettings.autoMix;
+	}
+
+	private fullStream(song: Song, bust = 0, offset = 0) {
+		// The same song ID can resolve to different media. Bind analysis to this request.
+		const mixToken = this.autoMixEnabled && !song.karaokeOf && !offset
+			? Array.from(crypto.getRandomValues(new Uint8Array(16)), (n) => n.toString(16).padStart(2, '0')).join('')
+			: undefined;
+		return { id: song.id, url: streamUrl(song.id, bust, offset, undefined, mixToken), mixToken };
+	}
+
+	private prepareMix() {
+		if (!this.autoMixEnabled) return;
+		const current = this.current;
+		const next = this.nextSong;
+		if (!this.playingSource?.mixToken || !current || !next || current.id === next.id || current.karaokeOf || next.karaokeOf || sleepTimer.isEndOfTrack) {
+			this.mixPair.clear();
+			return;
+		}
+		if (!this.startedSource || !this.playRequested || this.audio.paused || this.preroll || !navigator.onLine) return;
+		const duration = this.duration || current.duration || Infinity;
+		if (duration < CROSSFADE_S * 3) return;
+		const source = this.standbySource();
+		const issued = source?.kind === 'stream' && this.standbyFor !== source.url ? null : source;
+		this.mixPair.prepare(this.playingSource, issued, duration - this.time);
+	}
+
+	private mixDurationLimit() {
+		const outgoing = this.duration || this.current?.duration || Infinity;
+		const reported = this.nextSong?.duration ?? 0;
+		const el = this.standby;
+		const decoded = el && el.readyState >= 1 && Number.isFinite(el.duration) && el.duration >= 0 ? el.duration : Infinity;
+		return Math.min(outgoing, reported > 0 ? reported : Infinity, decoded) / 3;
 	}
 
 	/** Sound Check: the playing song's ReplayGain onto its element (unity when off). */
@@ -1179,12 +1246,14 @@ class Player {
 	 * still waits for this song's `ended`, so what's shown is the song ending; by then
 	 * the next one is already playing and simply takes over (`swapToStandby`).
 	 */
-	private startPreroll(remaining: number) {
+	private startPreroll(remaining: number, autoMix: boolean) {
 		const el = this.standby;
 		const output = this.output;
-		if (!el || !output) return;
+		const song = this.nextSong;
+		if (!el || !output || !song) return;
 		const nextIndex = this.queue[this.index + 1] ? this.index + 1 : 0;
 		const endsAt = performance.now() + remaining * 1000;
+		const checkMixDuration = this.autoMixEnabled;
 		const preroll = { el, listeners: new AbortController(), fading: false };
 		this.preroll = preroll;
 		output.silenceFade(el);
@@ -1194,9 +1263,18 @@ class Player {
 		el.addEventListener(
 			'playing',
 			() => {
-				const seconds = Math.max(0.5, (endsAt - performance.now()) / 1000);
+				const startedAt = performance.now();
+				const seconds = Math.max(0.5, (endsAt - startedAt) / 1000);
+				// Metadata can arrive between scheduling play() and the first audible frame.
+				if (checkMixDuration) {
+					const limit = this.mixDurationLimit();
+					if (limit < 1 || seconds > limit) {
+						this.cancelPreroll();
+						return;
+					}
+				}
 				preroll.fading = true;
-				this.crossfading = true;
+				this.transition = { song, startedAt, duration: seconds, autoMix };
 				logPlayback('crossfade', `${seconds.toFixed(1)}s`);
 				output.crossfade(this.audio, el, seconds);
 			},
@@ -1214,7 +1292,7 @@ class Player {
 		const preroll = this.preroll;
 		if (!preroll) return;
 		this.preroll = null;
-		this.crossfading = false;
+		this.transition = null;
 		preroll.listeners.abort();
 		preroll.el.pause();
 		try {
@@ -1245,13 +1323,16 @@ class Player {
 
 	/**
 	 * What the standby element should hold for the upcoming track: its downloaded copy
-	 * when there is one, else its stream once `standbyStreamId` asks for it.
+	 * when there is one, else the stream URL chosen when standby preparation began.
 	 */
-	private standbySource(): { id: string; url: string; kind: 'copy' | 'stream' } | null {
+	private standbySource(): (MixSource & { url: string; kind: 'copy' | 'stream' }) | null {
 		const next = this.nextSong;
 		if (!next || next.id === this.current?.id) return null;
-		if (this.nextReady?.id === next.id) return { id: next.id, url: this.nextReady.copy.url, kind: 'copy' };
-		if (this.standbyStreamId === next.id) return { id: next.id, url: streamUrl(next.id), kind: 'stream' };
+		if (this.nextReady?.id === next.id) {
+			const { id, copy, mixToken, prefetched } = this.nextReady;
+			return { id, url: copy.url, mixToken, prefetched, kind: 'copy' };
+		}
+		if (this.standbyStream?.id === next.id) return { ...this.standbyStream, kind: 'stream' };
 		return null;
 	}
 
@@ -1293,16 +1374,17 @@ class Player {
 	 */
 	private standbyNextStream() {
 		const next = this.nextSong;
-		if (!this.standbyAllowed() || !next || this.preparation?.id !== next.id || this.preparation.lookup) return;
-		if (this.nextReady?.id === next.id || this.standbyStreamId === next.id) return;
-		this.standbyStreamId = next.id;
-		this.preparation.warm.abort();
+		if (!this.startedSource || !this.standbyAllowed() || !next || this.preparation?.id !== next.id || this.preparation.lookup) return;
+		if (this.nextReady?.id === next.id || this.standbyStream?.id === next.id) return;
+		this.standbyStream = this.fullStream(next);
+		this.preparation.warm?.abort();
 		if (this.blobJob?.id === next.id) {
 			logPlayback('blob-cancel', `id=${next.id} streaming on standby instead`);
 			this.blobJob.abort.abort();
 			this.blobJob = null;
 		}
 		this.primeStandby();
+		this.prepareMix();
 	}
 
 	/**
@@ -1325,7 +1407,7 @@ class Player {
 		const preroll = this.preroll;
 		if (preroll) {
 			this.preroll = null;
-			this.crossfading = false;
+			this.transition = null;
 			preroll.listeners.abort();
 			// It never got to play under the old song, or a skip cut the fade short:
 			// full level now.
@@ -1362,13 +1444,13 @@ class Player {
 	}
 
 	private clearPreparation() {
-		this.preparation?.warm.abort();
+		this.preparation?.warm?.abort();
 		this.preparation = null;
 		this.blobJob?.abort.abort();
 		this.blobJob = null;
 		this.blobFailure = null;
 		this.cancelPreroll();
-		this.standbyStreamId = null;
+		this.standbyStream = null;
 		const ready = this.nextReady;
 		this.nextReady = null;
 		this.primeStandby();
@@ -1382,7 +1464,7 @@ class Player {
 		this.clearPreparation();
 		if (!next || !id || this.switching || !this.audio.src || this.destroyed) return;
 		const lookup = lookupOffline(id);
-		const preparation: NextPreparation = { id, lookup, warm: new AbortController() };
+		const preparation: NextPreparation = { id, lookup, warm: null };
 		this.preparation = preparation;
 		void lookup.then((copy) => {
 			if (!preparation.lookup) return; // load() owns the result
@@ -1392,8 +1474,7 @@ class Player {
 				return;
 			}
 			if (!copy) {
-				if (this.playRequested) this.prefetchInWindow();
-				if (!this.blobJob) void this.warmNext(next, preparation.warm.signal);
+				this.prepareNextStream();
 				return;
 			}
 			this.nextReady = { id: next.id, copy };
@@ -1414,14 +1495,8 @@ class Player {
 			const res = await fetch(streamUrl(next.id), { headers: { Range: 'bytes=0-1' }, cache: 'no-store', signal });
 			void res.body?.cancel();
 			if (signal.aborted) return;
-			if (res.ok) {
-				const suffix = suffixFromContentType(res.headers.get('content-type'));
-				if (suffix && next.suffix !== suffix) next.suffix = suffix;
-				const depth = Number(res.headers.get('x-audio-bit-depth')) || undefined;
-				const rate = Number(res.headers.get('x-audio-sample-rate')) || undefined;
-				if (depth && next.bitDepth !== depth) next.bitDepth = depth;
-				if (rate && next.sampleRate !== rate) next.sampleRate = rate;
-			}
+			const target = this.nextSong;
+			if (res.ok && target?.id === next.id) applyStreamFormat(target, res.headers);
 			logPlayback('warm-done', `id=${next.id} status=${res.status} ${Math.round(performance.now() - started)}ms`);
 		} catch (e) {
 			if (signal.aborted) return;
@@ -1429,24 +1504,23 @@ class Player {
 		}
 	}
 
-	private async learnCodec(song: Song, offline: boolean) {
-		if (offline) return;
+	private onPlaybackStarted() {
+		if (this.switching || !this.playRequested || this.audio.paused || !this.current) return;
+		if (!this.startedSource) {
+			this.startedSource = new AbortController();
+			if (!this.playingOffline) void this.learnCodec(this.current, this.startedSource.signal);
+		}
+		this.prepareNextStream();
+		this.prepareMix();
+	}
+
+	private async learnCodec(song: Song, signal: AbortSignal) {
 		if (!song.id.startsWith('st-') && !song.id.startsWith('yt-') && !song.id.startsWith('ytv-')) return;
 		try {
-			// The same two-byte probe `warmNext` uses; it also resolves a cold YouTube
-			// track on the server, so it is not wasted work.
-			const res = await fetch(streamUrl(song.id), { headers: { Range: 'bytes=0-1' }, cache: 'no-store' });
-			const suffix = res.ok ? suffixFromContentType(res.headers.get('content-type')) : '';
-			const depth = res.ok ? Number(res.headers.get('x-audio-bit-depth')) || undefined : undefined;
-			const rate = res.ok ? Number(res.headers.get('x-audio-sample-rate')) || undefined : undefined;
-			if (res.ok) void res.body?.cancel();
-			if (!suffix) return;
-			const target = this.queue[this.index];
-			if (target && target.id === song.id) {
-				if (target.suffix !== suffix) target.suffix = suffix;
-				if (depth && target.bitDepth !== depth) target.bitDepth = depth;
-				if (rate && target.sampleRate !== rate) target.sampleRate = rate;
-			}
+			const res = await fetch(streamUrl(song.id), { headers: { Range: 'bytes=0-1' }, cache: 'no-store', signal });
+			void res.body?.cancel();
+			const target = this.current;
+			if (res.ok && !signal.aborted && target?.id === song.id) applyStreamFormat(target, res.headers);
 		} catch {
 			/* the badge simply stays as it was */
 		}
@@ -1468,10 +1542,17 @@ class Player {
 		return 0;
 	}
 
-	private prefetchInWindow() {
+	private prepareNextStream() {
 		const next = this.nextSong;
+		const prep = this.preparation;
+		if (!this.startedSource || !this.playRequested || this.audio.paused || !next || !prep || prep.id !== next.id || prep.lookup) return;
+		if (this.standbyStream?.id === next.id || this.nextReady?.id === next.id || this.blobJob?.id === next.id) return;
 		const duration = this.duration || this.current?.duration || 0;
-		if (next && duration > 0 && duration - this.time <= blobLeadFor(next.id)) void this.prefetchNextBlob();
+		if (duration > 0 && duration - this.time <= blobLeadFor(next.id)) void this.prefetchNextBlob(next, prep);
+		if (!prep.warm && !this.blobJob && !this.blobFailure) {
+			prep.warm = new AbortController();
+			void this.warmNext(next, prep.warm.signal);
+		}
 	}
 
 	/**
@@ -1481,13 +1562,7 @@ class Player {
 	 * Failures are retried a few times, spaced out, because the lead is long enough
 	 * for a flaky or slow server to recover before the track ends.
 	 */
-	private async prefetchNextBlob() {
-		const next = this.nextSong;
-		if (!next || this.preparation?.id !== next.id || this.preparation.lookup) return;
-		// Already streaming into the standby element: a download would only compete with it.
-		if (this.standbyStreamId === next.id) return;
-		if (this.nextReady?.id === next.id || this.blobJob?.id === next.id) return;
-
+	private async prefetchNextBlob(next: Song, prep: NextPreparation) {
 		// If the current track is streaming over HTTP (not playing from a local blob/offline copy),
 		// don't compete with it if it is currently buffering or running low on forward buffer.
 		if (!this.playingOffline && this.audio.src && !this.audio.src.startsWith('blob:')) {
@@ -1508,7 +1583,7 @@ class Player {
 			return;
 		}
 
-		this.preparation.warm.abort();
+		prep.warm?.abort();
 		const job: BlobJob = { id: next.id, abort: new AbortController(), timedOut: false };
 		this.blobJob = job;
 		const timeout = setTimeout(() => {
@@ -1518,7 +1593,8 @@ class Player {
 		const attempt = (failure?.count ?? 0) + 1;
 		logPlayback('blob-start', `id=${next.id} "${next.title}" attempt=${attempt}`);
 		try {
-			const res = await fetch(streamUrl(next.id), { signal: job.abort.signal });
+			const source = this.fullStream(next);
+			const res = await fetch(source.url, { signal: job.abort.signal });
 			if (this.blobJob !== job) {
 				void res.body?.cancel();
 				return;
@@ -1545,7 +1621,8 @@ class Player {
 				return;
 			}
 			const blob = await readCapped(res, MAX_BLOB_BYTES);
-			if (this.blobJob !== job) return;
+			const target = this.nextSong;
+			if (this.blobJob !== job || target?.id !== next.id) return;
 			if (job.timedOut) throw new Error('timeout');
 			if (!blob || blob.size > MAX_BLOB_BYTES) {
 				this.blobFailure = { id: next.id, count: attempt, at: performance.now(), final: true };
@@ -1556,8 +1633,10 @@ class Player {
 			if (expected && blob.size !== expected) throw new Error(`incomplete track (${blob.size}/${expected} bytes)`);
 			const url = URL.createObjectURL(blob);
 			this.nextReady?.copy.revoke();
-			this.nextReady = { id: next.id, copy: { url, revoke: () => URL.revokeObjectURL(url) }, prefetched: true };
+			this.nextReady = { id: next.id, mixToken: source.mixToken, copy: { url, revoke: () => URL.revokeObjectURL(url) }, prefetched: true };
+			applyStreamFormat(target, res.headers);
 			this.primeStandby();
+			this.prepareMix();
 			this.blobFailure = null;
 			logPlayback('blob-ready', `id=${next.id} bytes=${blob.size} type=${blob.type}`);
 		} catch (e) {
@@ -1585,6 +1664,8 @@ class Player {
 			if (token === this.loadToken && !this.audio.paused) {
 				this.playing = true;
 				this.buffering = false;
+				// A standby element that already played under a crossfade may not emit playing again.
+				if (this.audio.readyState >= HAVE_FUTURE_DATA) this.onPlaybackStarted();
 			}
 		}).catch((e: unknown) => {
 			logPlayback('play-rejected', e instanceof DOMException ? `${e.name}: ${e.message}` : String(e));
@@ -1749,7 +1830,8 @@ class Player {
 			this.lastPositionSlot = slot;
 			this.updatePosition();
 		}
-		this.prefetchInWindow();
+		this.prepareNextStream();
+		this.prepareMix();
 		// The real audio is over; don't sit through the silence up to the misread length.
 		// Switch straight to the next track without pausing: on a hidden iOS page a pause
 		// ends the audio session, and the next track then never gets past its metadata.
@@ -1766,11 +1848,16 @@ class Player {
 		const ready = !!source && this.standbyHolds(source.url);
 		// Crossfade: start the next song under this one's last seconds. The switch to it
 		// waits for `ended`, which also keeps some element playing throughout.
-		const fade = this.crossfadeFor(dur);
-		if (fade && ready && !this.preroll && remaining <= fade) this.startPreroll(remaining);
+		if (this.output && audioSettings.crossfade && ready && !this.preroll && dur >= CROSSFADE_S * 3) {
+			const adaptive = this.autoMixEnabled ? this.mixPair.overlap(this.playingSource, source) : 0;
+			const fade = this.autoMixEnabled ? Math.min(adaptive || CROSSFADE_S, this.mixDurationLimit()) : CROSSFADE_S;
+			if (fade >= 1 && remaining <= fade) this.startPreroll(remaining, adaptive > 0);
+		}
 		// Otherwise hand over to the standby element just before the end, while this
 		// one still plays.
-		if (!this.preroll && ready && remaining <= HANDOFF_LEAD_S) {
+		const handoffLead = this.android && document.hidden && !(this.output && audioSettings.crossfade)
+			? ANDROID_HIDDEN_HANDOFF_LEAD_S : HANDOFF_LEAD_S;
+		if (!this.preroll && ready && remaining <= handoffLead) {
 			logPlayback(
 				'handoff-early',
 				`t=${a.currentTime.toFixed(2)} dur=${dur.toFixed(2)} ${source!.kind} standby rs=${this.standby?.readyState}`
@@ -2006,6 +2093,10 @@ class Player {
 	private unload() {
 		this.cancelPreroll();
 		this.loadToken++;
+		this.mixPair.clear();
+		this.playingSource = null;
+		this.startedSource?.abort();
+		this.startedSource = null;
 		this.androidStartTime = null;
 		this.playRequested = false;
 		this.resumeWhenVisible = false;
@@ -2022,7 +2113,7 @@ class Player {
 		this.retiring?.listeners.abort();
 		this.retiring = null;
 		this.standbyFor = null;
-		this.standbyStreamId = null;
+		this.standbyStream = null;
 		if (this.standby) {
 			this.standby.autoplay = false;
 			this.standby.pause();

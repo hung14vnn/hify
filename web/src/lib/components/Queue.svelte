@@ -174,9 +174,9 @@
 			aria-pressed={player.webAudio && audioSettings.crossfade}
 			disabled={!player.webAudio}
 			aria-label={player.webAudio
-				? "Crossfade"
+				? audioSettings.autoMix ? "AutoMix" : "Crossfade"
 				: "Crossfade — requires the Web Audio engine (Account › Playback)"}
-			title={player.webAudio ? "Crossfade" : "Crossfade requires the Web Audio engine"}
+			title={player.webAudio ? (audioSettings.autoMix ? "AutoMix" : "Crossfade") : "Crossfade requires the Web Audio engine"}
 			onclick={() => audioSettings.setCrossfade(!audioSettings.crossfade)}
 		>
 			<Icon name="crossfade" size={19} />

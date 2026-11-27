@@ -2,10 +2,11 @@
 	// Floating mini player above the tab bar (iOS 26-style pill).
 	import { artistName } from '../format';
 	import { getPlayer } from '../player.svelte';
-	import { artSwap, fadeOnly, pop, rise, textSwap } from '../motion';
+	import { pop, rise, textSwap } from '../motion';
 	import { ui } from '../ui.svelte';
 	import Artwork from './Artwork.svelte';
 	import Icon from './Icon.svelte';
+	import TrackBlend from './TrackBlend.svelte';
 
 	let { compactDock = false }: { compactDock?: boolean } = $props();
 	const player = getPlayer();
@@ -112,12 +113,6 @@
 		ui.openNowPlaying();
 	}
 
-	function artIntro(node: Element, options: { duration?: number }) {
-		// `artSwap` writes a scale transform.  In the compact dock the artwork
-		// already has a permanent CSS scale, so use an opacity-only swap instead
-		// of briefly overriding that scale and snapping back to it.
-		return compactDock ? fadeOnly(node, { duration: 160 }) : artSwap(node, options);
-	}
 </script>
 
 {#if song}
@@ -137,17 +132,15 @@
 
 		<div class="content" bind:this={contentEl}>
 			<button class="open" onclick={openNowPlaying} aria-label="Open Now Playing">
+				<span class="art" data-np-art data-flip="art" data-flip-scale>
+					<TrackBlend>
+						{#snippet children(track)}
+							<Artwork id={track.coverArt} size={64} seed={track.album ?? track.title} />
+						{/snippet}
+					</TrackBlend>
+				</span>
 				{#key song.id}
-					<span
-						class="art"
-						data-np-art
-						data-flip="art"
-						data-flip-scale
-						in:artIntro={{ duration: 320 }}
-					>
-						<Artwork id={song.coverArt} size={64} seed={song.album ?? song.title} />
-					</span>
-					<span class="meta" data-flip="meta" in:textSwap>
+					<span class="meta" data-flip="meta" in:textSwap={{ dx: 5, duration: 220 }}>
 						<span class="title ellipsis" data-np-title>{song.title}</span>
 						<span class="artist ellipsis" data-np-artist>{artistName(song)}</span>
 					</span>
@@ -245,6 +238,8 @@
 	}
 	.art {
 		/* never shrink the artwork to make room for a long title */
+		position: relative;
+		aspect-ratio: 1;
 		flex: none;
 		width: 40px;
 		margin-left: 6px;

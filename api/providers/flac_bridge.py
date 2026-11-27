@@ -8,6 +8,8 @@ responses are rejected because the player is a plain <audio> element.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import re
 import time
@@ -18,6 +20,7 @@ from typing import Any
 import httpx
 
 from config import settings
+from providers import start_lookup
 
 logger = logging.getLogger("music")
 
@@ -30,6 +33,8 @@ _RESOLVE_TTL = 30 * 60.0
 _URL_TTL = 30 * 60.0
 _URL_EXPIRY_BUFFER_S = 5 * 60.0
 
+_TrackKey = tuple[str, str, float | None, str | None, str]
+
 
 @dataclass(slots=True)
 class FlacStream:
@@ -40,6 +45,7 @@ class FlacStream:
     bit_depth: int | None = None
     sample_rate: int | None = None
     is_dash: bool = False
+    recording_key: str | None = None
 
 
 def _clean_track_title(title: str) -> str:
@@ -94,21 +100,30 @@ class FlacBridge:
         self._http = client
         self._addons = tuple(_base(item) for item in settings.eclipse_addons)
         self._manifests: dict[str, tuple[float, dict[str, Any] | None]] = {}
-        self._resolved: dict[str, tuple[float, str, str]] = {}
+        self._resolved: dict[_TrackKey, tuple[float, str, str]] = {}
         self._urls: dict[str, tuple[float, FlacStream]] = {}
         self._access_tokens: dict[str, tuple[float, str]] = {}
+        self._pending_manifests: dict[str, asyncio.Task[dict[str, Any] | None]] = {}
+        self._pending_tokens: dict[str, asyncio.Task[str | None]] = {}
+        self._pending_tracks: dict[_TrackKey, asyncio.Task[FlacStream | None]] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self._addons)
 
-    async def _get_access_token(self, addon_id: str) -> str | None:
-        if not settings.eclipse_bearer_token:
+    async def _get_access_token(self, addon_id: str | None) -> str | None:
+        if not settings.eclipse_bearer_token or not addon_id:
             return None
-        now = time.monotonic()
         cached = self._access_tokens.get(addon_id)
-        if cached and cached[0] > now:
+        if cached and cached[0] > time.monotonic():
             return cached[1]
+        task = self._pending_tokens.get(addon_id)
+        if task is None:
+            task = start_lookup(self._pending_tokens, addon_id, self._request_token(addon_id))
+        return await asyncio.shield(task)
+
+    async def _request_token(self, addon_id: str) -> str | None:
+        now = time.monotonic()
         try:
             resp = await self._http.post(
                 "https://api.eclipsemusic.app/api/addon-access/token",
@@ -166,10 +181,16 @@ class FlacBridge:
                 logger.warning("flac_bridge: warm manifest failed for %s: %s", base, exc)
 
     async def _manifest(self, base: str) -> dict[str, Any] | None:
-        now = time.monotonic()
         cached = self._manifests.get(base)
-        if cached and cached[0] > now:
+        if cached and cached[0] > time.monotonic():
             return cached[1]
+        task = self._pending_manifests.get(base)
+        if task is None:
+            task = start_lookup(self._pending_manifests, base, self._request_manifest(base))
+        return await asyncio.shield(task)
+
+    async def _request_manifest(self, base: str) -> dict[str, Any] | None:
+        now = time.monotonic()
         data = await self._json(base + "/manifest.json")
         if data is not None and isinstance(data.get("resources"), list):
             resources = {str(item) for item in data["resources"]}
@@ -318,6 +339,7 @@ class FlacBridge:
             bit_depth=int(stream["bitDepth"]) if stream.get("bitDepth") else None,
             sample_rate=int(stream["sampleRate"]) if stream.get("sampleRate") else None,
             is_dash=is_dash,
+            recording_key="flac:" + hashlib.sha256(f"{base}\0{track_id}".encode()).hexdigest(),
         )
         self._urls[key] = (expires, result)
         logger.info(
@@ -342,7 +364,15 @@ class FlacBridge:
         if not self.enabled or not artist or not title:
             return None
         effective = (quality or settings.eclipse_quality).upper()
-        key = f"{_norm(artist)}|{_norm(title)}|{round(duration_s or 0)}|{effective}"
+        key = (artist, title, duration_s, isrc, effective)
+        task = self._pending_tracks.get(key)
+        if task is None:
+            task = start_lookup(self._pending_tracks, key, self._resolve_track(key))
+        # Cancelling a two-byte probe must not cancel the player's lookup.
+        return await asyncio.shield(task)
+
+    async def _resolve_track(self, key: _TrackKey) -> FlacStream | None:
+        artist, title, duration_s, isrc, effective = key
         now = time.monotonic()
         cached = self._resolved.get(key)
         for base in self._addons:
