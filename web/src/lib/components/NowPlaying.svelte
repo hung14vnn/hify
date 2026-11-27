@@ -1333,10 +1333,8 @@
 										in:rise={{ distance: 5, duration: 260 }}
 										out:fadeOnly={{ duration: 180 }}
 									>
-										<Icon name={mix.autoMix ? "autoMix" : "crossfade"} size={11} />
 										<span class="fade-notice-text">
-											{mix.autoMix ? "Mixing" : "Fading"} into
-											“{mix.song.title}”
+											{mix.autoMix ? "Mixing" : "Fading"}
 										</span>
 									</span>
 								{:else if qualityBadgeLabel}
@@ -1347,35 +1345,6 @@
 										title="Audio Quality & Technical Details"
 										in:fadeOnly={{ duration: 200 }}
 									>
-										<svg
-											class="quality-icon"
-											viewBox="0 0 26 16"
-											aria-hidden="true"
-										>
-											<path
-												d="M2 4c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
-												fill="none"
-												stroke="currentColor"
-												stroke-width="1.7"
-												stroke-linecap="round"
-											/>
-											<path
-												d="M2 8c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
-												fill="none"
-												stroke="currentColor"
-												stroke-width="1.7"
-												stroke-linecap="round"
-												opacity="0.78"
-											/>
-											<path
-												d="M2 12c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
-												fill="none"
-												stroke="currentColor"
-												stroke-width="1.7"
-												stroke-linecap="round"
-												opacity="0.55"
-											/>
-										</svg>
 										<span class="badge-text"
 											>{qualityBadgeLabel}</span
 										>
@@ -2031,12 +2000,23 @@
 		animation: mixShimmer 2.4s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 	}
 	@keyframes mixShimmer {
-		0% { background-position: 100% 0; }
-		100% { background-position: -120% 0; }
+		0% {
+			background-position: 100% 0;
+		}
+		100% {
+			background-position: -120% 0;
+		}
 	}
 	@keyframes mixPulse {
-		0%, 100% { opacity: 0.65; transform: scale(0.96); }
-		50% { opacity: 1; transform: scale(1.06); }
+		0%,
+		100% {
+			opacity: 0.65;
+			transform: scale(0.96);
+		}
+		50% {
+			opacity: 1;
+			transform: scale(1.06);
+		}
 	}
 	@media (prefers-reduced-motion: reduce) {
 		.fade-notice :global(svg) {
