@@ -11,7 +11,12 @@
 	import { songMenu } from "../menus";
 	import type { TransitionConfig } from "svelte/transition";
 	import { fadeOnly, pop, sheet, textSwap } from "../motion";
-	import { coverUrl, getPlaybackQuality, setPlaybackQuality, type PlaybackQuality } from "../api";
+	import {
+		coverUrl,
+		getPlaybackQuality,
+		setPlaybackQuality,
+		type PlaybackQuality,
+	} from "../api";
 	import { artworkTint } from "../palette";
 	import { getPlayer } from "../player.svelte";
 	import { sleepTimer } from "../sleepTimer.svelte";
@@ -79,18 +84,39 @@
 				(song?.bitRate ?? 0) > 1500;
 			return hiRes ? "Hi-Res Lossless" : "Lossless";
 		}
-		const codec = s === "webm" || s === "opus" ? "Opus" : s === "m4a" ? "AAC" : s.toUpperCase();
+		const codec =
+			s === "webm" || s === "opus"
+				? "Opus"
+				: s === "m4a"
+					? "AAC"
+					: s.toUpperCase();
 		return song?.bitRate ? `${codec} · ${song.bitRate} kbps` : codec;
 	});
 
 	let showAudioSpecs = $state(false);
 	let playbackQuality = $state<PlaybackQuality | null>(null);
 	let qualityBusy = $state(false);
-	const QUALITY_OPTIONS: { value: PlaybackQuality; label: string; detail: string }[] = [
-		{ value: "HI_RES_LOSSLESS", label: "Hi-Res Lossless", detail: "Up to 24-bit / 192 kHz" },
-		{ value: "LOSSLESS", label: "Lossless", detail: "CD · 16-bit / 44.1 kHz" },
-		{ value: "HIGH", label: "High", detail: "AAC · same source, lighter on data" },
-		{ value: "LOW", label: "Low", detail: "YouTube · least data" }
+	const QUALITY_OPTIONS: {
+		value: PlaybackQuality;
+		label: string;
+		detail: string;
+	}[] = [
+		{
+			value: "HI_RES_LOSSLESS",
+			label: "Hi-Res Lossless",
+			detail: "Up to 24-bit / 192 kHz",
+		},
+		{
+			value: "LOSSLESS",
+			label: "Lossless",
+			detail: "CD · 16-bit / 44.1 kHz",
+		},
+		{
+			value: "HIGH",
+			label: "High",
+			detail: "AAC · same source, lighter on data",
+		},
+		{ value: "LOW", label: "Low", detail: "YouTube · least data" },
 	];
 
 	getPlaybackQuality()
@@ -102,7 +128,9 @@
 		qualityBusy = true;
 		try {
 			playbackQuality = await setPlaybackQuality(value);
-			const label = QUALITY_OPTIONS.find((option) => option.value === value)?.label ?? value;
+			const label =
+				QUALITY_OPTIONS.find((option) => option.value === value)
+					?.label ?? value;
 			ui.showToast(`Playback quality: ${label}`);
 			player.reloadCurrent();
 		} catch {
@@ -127,7 +155,8 @@
 
 	const replayGainLabel = $derived.by(() => {
 		const g = song?.replayGain?.trackGain;
-		if (typeof g === "number") return `${g > 0 ? "+" : ""}${g.toFixed(1)} dB`;
+		if (typeof g === "number")
+			return `${g > 0 ? "+" : ""}${g.toFixed(1)} dB`;
 		return audioSettings.soundCheck ? "0.0 dB (Check on)" : "Off";
 	});
 
@@ -166,7 +195,9 @@
 	async function requestWakeLock() {
 		const wakeLockApi = (
 			navigator as Navigator & {
-				wakeLock?: { request(type: "screen"): Promise<WakeLockSentinel> };
+				wakeLock?: {
+					request(type: "screen"): Promise<WakeLockSentinel>;
+				};
 			}
 		).wakeLock;
 		if (!wakeLockApi || wakeLock) return;
@@ -200,7 +231,10 @@
 
 		return () => {
 			clearTimeout(controlsTimer);
-			document.removeEventListener("visibilitychange", onVisibilityChange);
+			document.removeEventListener(
+				"visibilitychange",
+				onVisibilityChange,
+			);
 			void releaseWakeLock();
 		};
 	});
@@ -253,7 +287,9 @@
 
 	$effect(() => {
 		const mq = window.matchMedia("(max-width: 899px)");
-		const pq = window.matchMedia("(max-width: 899px) and (orientation: portrait)");
+		const pq = window.matchMedia(
+			"(max-width: 899px) and (orientation: portrait)",
+		);
 		const update = () => {
 			isMobile = mq.matches;
 			isPortrait = pq.matches;
@@ -312,10 +348,10 @@
 	const FLIP_MS_CLOSE = 520;
 
 	/**
-	* Portrait phones: the big cover is the backdrop hero, the small cover is the
-	* art box. Opening a panel shrinks the hero into the thumbnail; closing grows
-	* it back. Single-element flight prevents any ghosting/double-image artifacts.
-	*/
+	 * Portrait phones: the big cover is the backdrop hero, the small cover is the
+	 * art box. Opening a panel shrinks the hero into the thumbnail; closing grows
+	 * it back. Single-element flight prevents any ghosting/double-image artifacts.
+	 */
 	function heroFlip(opening: boolean, layersBefore?: DOMRect) {
 		heroAnims.forEach((a) => a.cancel());
 		heroAnims = [];
@@ -335,7 +371,10 @@
 		const small = `translate3d(${thumb.left - h.left}px, ${thumb.top - h.top}px, 0) scale(${thumb.width / h.width}, ${thumb.height / h.height})`;
 		const full = "translate3d(0, 0, 0) scale(1, 1)";
 		const duration = opening ? FLIP_MS_OPEN : FLIP_MS_CLOSE;
-		const opts: KeyframeAnimationOptions = { duration, easing: FLIP_EASING };
+		const opts: KeyframeAnimationOptions = {
+			duration,
+			easing: FLIP_EASING,
+		};
 		const run = (el: HTMLElement, frames: Keyframe[]) => {
 			const anim = el.animate(frames, opts);
 			anim.onfinish = () => anim.cancel();
@@ -482,7 +521,10 @@
 		if (opening) panelReady = false;
 		flip(() => ui.togglePanel(panel)).finally(() => {
 			if (!opening) return void (panelReady = true);
-			panelReadyTimer = setTimeout(() => (panelReady = true), FLIP_MS_OPEN - 60);
+			panelReadyTimer = setTimeout(
+				() => (panelReady = true),
+				FLIP_MS_OPEN - 60,
+			);
 		});
 	}
 
@@ -536,7 +578,10 @@
 	];
 	const MORPH_TEXT = [
 		{ from: "[data-np-title]", to: ".info .title, .art-row.mini .c-title" },
-		{ from: "[data-np-artist]", to: ".info .artist, .art-row.mini .c-artist" },
+		{
+			from: "[data-np-artist]",
+			to: ".info .artist, .art-row.mini .c-artist",
+		},
 	];
 	let morphAnims: Animation[] = [];
 	/** Direction the current animations' keyframes were built for. */
@@ -560,8 +605,10 @@
 			// from where they are and land when Svelte's (shortened) timer does.
 			if (morphAnims.some((a) => a.playState === "running")) {
 				for (const a of morphAnims) {
-					const own = Number(a.effect?.getTiming().duration) || duration;
-					a.playbackRate = ((dir === morphBuiltFor ? 1 : -1) * own) / duration;
+					const own =
+						Number(a.effect?.getTiming().duration) || duration;
+					a.playbackRate =
+						((dir === morphBuiltFor ? 1 : -1) * own) / duration;
 				}
 				return { duration };
 			}
@@ -569,7 +616,8 @@
 			morphAnims = [];
 			morphBuiltFor = dir;
 
-			const anchorEl = document.querySelector<HTMLElement>("[data-np-anchor]");
+			const anchorEl =
+				document.querySelector<HTMLElement>("[data-np-anchor]");
 			const anchor = anchorEl?.getBoundingClientRect();
 			if (
 				!anchor?.width ||
@@ -582,7 +630,10 @@
 				const keyframes =
 					dir === "out"
 						? frames
-								.map((f) => ({ ...f, offset: 1 - (f.offset as number) }))
+								.map((f) => ({
+									...f,
+									offset: 1 - (f.offset as number),
+								}))
 								.reverse()
 						: frames;
 				const anim = el.animate(keyframes, {
@@ -613,7 +664,9 @@
 			// hero box, so both directions read as the same image moving.
 			// With a panel open (portrait) the big image is hidden; the thumbnail flies instead.
 			const heroes = node.querySelectorAll<HTMLElement>(
-				mobileOpen && isPortrait ? ".art-row .art-wrap" : ".backdrop-art",
+				mobileOpen && isPortrait
+					? ".art-row .art-wrap"
+					: ".backdrop-art",
 			);
 			const from = document
 				.querySelector<HTMLElement>("[data-np-art]")
@@ -647,14 +700,21 @@
 			// text onto the big text, so they read as the same line.
 			// The title's flight, so a line with no visible source (the artist, hidden
 			// in the compact dock) can ride along under it instead of being crossed.
-			let lead: { dx: number; dy: number; s: number; box: DOMRect } | null = null;
+			let lead: {
+				dx: number;
+				dy: number;
+				s: number;
+				box: DOMRect;
+			} | null = null;
 			for (const pair of MORPH_TEXT) {
 				const source = document.querySelector<HTMLElement>(pair.from);
 				const target = node.querySelector<HTMLElement>(pair.to);
 				if (!target) continue;
 				const a = source?.getBoundingClientRect();
 				const visible =
-					source && a?.height && getComputedStyle(source).opacity !== "0";
+					source &&
+					a?.height &&
+					getComputedStyle(source).opacity !== "0";
 				const t = target.getBoundingClientRect();
 				if (!visible) {
 					if (!lead) {
@@ -667,7 +727,8 @@
 					}
 					// Same transform as the title, re-based on this element's origin so
 					// both move as one block (d = d_lead + (s - 1)(origin - lead origin)).
-					const gx = lead.dx + (lead.s - 1) * (t.left - lead.box.left);
+					const gx =
+						lead.dx + (lead.s - 1) * (t.left - lead.box.left);
 					const gy = lead.dy + (lead.s - 1) * (t.top - lead.box.top);
 					play(target, [
 						{
@@ -704,12 +765,17 @@
 				const src = getComputedStyle(source);
 				const tgt = getComputedStyle(target);
 				const spacing = (cs: CSSStyleDeclaration) =>
-					cs.letterSpacing === "normal" ? 0 : parseFloat(cs.letterSpacing) || 0;
+					cs.letterSpacing === "normal"
+						? 0
+						: parseFloat(cs.letterSpacing) || 0;
 				const fromType = {
 					fontWeight: src.fontWeight,
 					letterSpacing: `${spacing(src) / s}px`,
 				};
-				const toType = { fontWeight: tgt.fontWeight, letterSpacing: `${spacing(tgt)}px` };
+				const toType = {
+					fontWeight: tgt.fontWeight,
+					letterSpacing: `${spacing(tgt)}px`,
+				};
 				if (
 					fromType.fontWeight !== toType.fontWeight ||
 					fromType.letterSpacing !== toType.letterSpacing
@@ -724,8 +790,16 @@
 				// Transform in its own animation (compositor); colour separately and
 				// only when the two differ (light theme).
 				play(target, [
-					{ offset: 0, transformOrigin: "0 0", transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})` },
-					{ offset: 1, transformOrigin: "0 0", transform: "translate3d(0, 0, 0) scale(1)" },
+					{
+						offset: 0,
+						transformOrigin: "0 0",
+						transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})`,
+					},
+					{
+						offset: 1,
+						transformOrigin: "0 0",
+						transform: "translate3d(0, 0, 0) scale(1)",
+					},
 				]);
 				if (fromColor !== toColor)
 					play(target, [
@@ -758,7 +832,12 @@
 				const source = document.querySelector<HTMLElement>(pair.from);
 				const a = source?.querySelector("svg")?.getBoundingClientRect();
 				const b = target.querySelector("svg")?.getBoundingClientRect();
-				if (!source || !a?.width || !b?.width || getComputedStyle(source).opacity === "0") {
+				if (
+					!source ||
+					!a?.width ||
+					!b?.width ||
+					getComputedStyle(source).opacity === "0"
+				) {
 					play(target, [
 						{ offset: 0, opacity: 0 },
 						{ offset: 0.55, opacity: 0 },
@@ -774,8 +853,16 @@
 				const origin = `${b.left + b.width / 2 - t.left}px ${b.top + b.height / 2 - t.top}px`;
 				// Transform only, so this stays a compositor animation.
 				play(target, [
-					{ offset: 0, transformOrigin: origin, transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})` },
-					{ offset: 1, transformOrigin: origin, transform: "translate3d(0, 0, 0) scale(1)" },
+					{
+						offset: 0,
+						transformOrigin: origin,
+						transform: `translate3d(${dx}px, ${dy}px, 0) scale(${s})`,
+					},
+					{
+						offset: 1,
+						transformOrigin: origin,
+						transform: "translate3d(0, 0, 0) scale(1)",
+					},
 				]);
 				// Colour (a repaint) separately, on the icon, and only when it differs
 				// (light theme); in dark mode both are white and nothing runs.
@@ -815,7 +902,14 @@
 		if (e.key !== "Escape") return;
 		// An overlay on top (menu, pickers, removal prompt) takes this Escape (Overlays).
 		// Listened to in the capture phase so this sees them before Overlays closes them.
-		if (ui.menu || ui.playlistPicker || ui.sleepTimerPicker || ui.removal || player.karaokeWaiting) return;
+		if (
+			ui.menu ||
+			ui.playlistPicker ||
+			ui.sleepTimerPicker ||
+			ui.removal ||
+			player.karaokeWaiting
+		)
+			return;
 		if (showAudioSpecs) showAudioSpecs = false;
 		else close();
 	}
@@ -846,9 +940,14 @@
 		<TrackBlend>
 			{#snippet children(track)}
 				<div class="backdrop-art">
-					<Artwork src={coverUrl(track.coverArt, 1200)} size={600} seed={track.album ?? track.title} priority />
+					<Artwork
+						src={coverUrl(track.coverArt, 1200)}
+						size={600}
+						seed={track.album ?? track.title}
+						priority
+					/>
 				</div>
-				{#await (browser ? artworkTint(track.coverArt) : null) then tint}
+				{#await browser ? artworkTint(track.coverArt) : null then tint}
 					{#if tint}
 						<div
 							class="tint-flat"
@@ -862,7 +961,10 @@
 							style:--glow={tint.glow ?? "transparent"}
 							in:fadeOnly={{ duration: 180 }}
 						>
-							<div class="mesh-aura" class:paused={!player.playing || mobileOpen}></div>
+							<div
+								class="mesh-aura"
+								class:paused={!player.playing || mobileOpen}
+							></div>
 						</div>
 					{/if}
 				{/await}
@@ -924,7 +1026,8 @@
 								aria-pressed={playbackQuality === option.value}
 								onclick={() => chooseQuality(option.value)}
 							>
-								<span class="quality-label">{option.label}</span>
+								<span class="quality-label">{option.label}</span
+								>
 								<small>{option.detail}</small>
 							</button>
 						{/each}
@@ -934,14 +1037,18 @@
 				<div class="specs-grid">
 					<div class="spec-card">
 						<span class="spec-label">Format / Codec</span>
-						<span class="spec-val highlight">{(song.suffix ?? "N/A").toUpperCase()}</span>
+						<span class="spec-val highlight"
+							>{(song.suffix ?? "N/A").toUpperCase()}</span
+						>
 					</div>
 					<div class="spec-card">
 						<span class="spec-label">Bitrate</span>
 						<span class="spec-val">
 							{song.bitRate
 								? `${song.bitRate} kbps`
-								: (LOSSLESS.has(song.suffix?.toLowerCase() ?? '') ? 'Lossless VBR' : 'Standard')}
+								: LOSSLESS.has(song.suffix?.toLowerCase() ?? "")
+									? "Lossless VBR"
+									: "Standard"}
 						</span>
 					</div>
 					<div class="spec-card">
@@ -954,7 +1061,11 @@
 					</div>
 					<div class="spec-card">
 						<span class="spec-label">Audio Engine</span>
-						<span class="spec-val">{player.webAudio ? "Web Audio DSP" : "Native Audio"}</span>
+						<span class="spec-val"
+							>{player.webAudio
+								? "Web Audio DSP"
+								: "Native Audio"}</span
+						>
 					</div>
 					<div class="spec-card">
 						<span class="spec-label">Sound Check</span>
@@ -963,12 +1074,22 @@
 					<div class="spec-card">
 						<span class="spec-label">Equalizer</span>
 						<span class="spec-val">
-							{audioSettings.eqEnabled ? audioSettings.preset : (audioSettings.enhancer ? 'Sound Enhancer' : 'Flat')}
+							{audioSettings.eqEnabled
+								? audioSettings.preset
+								: audioSettings.enhancer
+									? "Sound Enhancer"
+									: "Flat"}
 						</span>
 					</div>
 					<div class="spec-card">
 						<span class="spec-label">Song Transitions</span>
-						<span class="spec-val">{player.webAudio && audioSettings.crossfade ? (audioSettings.autoMix ? 'AutoMix' : 'Crossfade') : 'Off'}</span>
+						<span class="spec-val"
+							>{player.webAudio && audioSettings.crossfade
+								? audioSettings.autoMix
+									? "AutoMix"
+									: "Crossfade"
+								: "Off"}</span
+						>
 					</div>
 				</div>
 
@@ -1000,11 +1121,16 @@
 					out:textSwap={{ dx: -40, duration: 240 }}
 					onwheel={panel === "lyrics" ? showControls : undefined}
 					ontouchmove={panel === "lyrics" ? showControls : undefined}
-					onpointerdown={panel === "lyrics" ? showControls : undefined}
+					onpointerdown={panel === "lyrics"
+						? showControls
+						: undefined}
 				>
 					{#if panelReady}
 						<div class="panel-fill" in:fadeOnly={{ duration: 220 }}>
-							{#if panel === "lyrics"}<Lyrics />{:else}<Queue oncontrols={(visible) => (controlsVisible = visible)} />{/if}
+							{#if panel === "lyrics"}<Lyrics />{:else}<Queue
+									oncontrols={(visible) =>
+										(controlsVisible = visible)}
+								/>{/if}
 						</div>
 					{/if}
 				</div>
@@ -1023,7 +1149,12 @@
 							<div class="art-layers">
 								<TrackBlend>
 									{#snippet children(track)}
-										<Artwork id={track.coverArt} size={600} seed={track.album ?? track.title} priority />
+										<Artwork
+											id={track.coverArt}
+											size={600}
+											seed={track.album ?? track.title}
+											priority
+										/>
 									{/snippet}
 								</TrackBlend>
 							</div>
@@ -1031,9 +1162,18 @@
 					</div>
 					<div class="meta" inert={!mobileOpen ? true : undefined}>
 						{#key song.id}
-							<div class="compact-caption" in:textSwap={{ dx: 5, duration: 220 }}>
-								<span class="c-title ellipsis">{song.title}</span>
-								<ArtistLinks class="c-artist ellipsis" item={song} onclick={close} />
+							<div
+								class="compact-caption"
+								in:textSwap={{ dx: 5, duration: 220 }}
+							>
+								<span class="c-title ellipsis"
+									>{song.title}</span
+								>
+								<ArtistLinks
+									class="c-artist ellipsis"
+									item={song}
+									onclick={close}
+								/>
 							</div>
 						{/key}
 					</div>
@@ -1073,7 +1213,10 @@
 					class="controls"
 					class:panel-open={mobileOpen}
 					class:overlay={mobileOpen && !!ui.panel}
-					class:controls-hidden={isMobile && !!ui.panel && player.playing && !controlsVisible}
+					class:controls-hidden={isMobile &&
+						!!ui.panel &&
+						player.playing &&
+						!controlsVisible}
 				>
 					{#if !mobileOpen}
 						<div
@@ -1137,12 +1280,17 @@
 								class="sing-float"
 								class:on={!!player.karaoke}
 								aria-pressed={!!player.karaoke}
-								aria-label={player.karaoke ? "Karaoke on — back to the original" : "Karaoke"}
+								aria-label={player.karaoke
+									? "Karaoke on — back to the original"
+									: "Karaoke"}
 								disabled={player.karaokeLoading}
 								onclick={toggleKaraoke}
 							>
 								{#if player.karaokeLoading}
-									<span class="karaoke-spin" aria-hidden="true"></span>
+									<span
+										class="karaoke-spin"
+										aria-hidden="true"
+									></span>
 								{:else}
 									<Icon name="micSing" size={18} />
 								{/if}
@@ -1171,7 +1319,8 @@
 								{:else if sleepTimer.isActive}
 									<button
 										class="quality active-timer-text"
-										onclick={() => (ui.sleepTimerPicker = true)}
+										onclick={() =>
+											(ui.sleepTimerPicker = true)}
 									>
 										<Icon name="clock" size={11} />
 										{sleepTimer.isCountdown
@@ -1186,7 +1335,8 @@
 									>
 										<Icon name="crossfade" size={11} />
 										<span class="fade-notice-text">
-											{mix.autoMix ? "Mixing" : "Fading"} into “{mix.song.title}”
+											{mix.autoMix ? "Mixing" : "Fading"} into
+											“{mix.song.title}”
 										</span>
 									</span>
 								{:else if qualityBadgeLabel}
@@ -1197,7 +1347,11 @@
 										title="Audio Quality & Technical Details"
 										in:fadeOnly={{ duration: 200 }}
 									>
-										<svg class="quality-icon" viewBox="0 0 26 16" aria-hidden="true">
+										<svg
+											class="quality-icon"
+											viewBox="0 0 26 16"
+											aria-hidden="true"
+										>
 											<path
 												d="M2 4c2.6-3 5.4-3 8 0s5.4 3 8 0 4-1.6 6-.6"
 												fill="none"
@@ -1222,7 +1376,9 @@
 												opacity="0.55"
 											/>
 										</svg>
-										<span class="badge-text">{qualityBadgeLabel}</span>
+										<span class="badge-text"
+											>{qualityBadgeLabel}</span
+										>
 									</button>
 								{/if}
 							</div>
@@ -1311,12 +1467,17 @@
 						<button
 							class="foot"
 							class:on={ui.panel === "queue"}
-							aria-label={player.shuffle ? "Playing Next, shuffle on" : "Playing Next"}
+							aria-label={player.shuffle
+								? "Playing Next, shuffle on"
+								: "Playing Next"}
 							aria-pressed={ui.panel === "queue"}
 							onclick={() => toggleMobilePanel("queue")}
 						>
 							<!-- Shuffle on: the shuffle variant of the icon, as Apple Music shows it. -->
-							<Icon name={player.shuffle ? "queueShuffle" : "queue"} size={21} />
+							<Icon
+								name={player.shuffle ? "queueShuffle" : "queue"}
+								size={21}
+							/>
 						</button>
 					</div>
 				</div>
@@ -1397,14 +1558,17 @@
 		position: absolute;
 		inset: 0;
 		z-index: 1;
-		background:
-			linear-gradient(
+		background: linear-gradient(
 				180deg,
 				rgb(0 0 0 / 0.06) 0%,
 				rgb(0 0 0 / 0.16) 38%,
 				rgb(0 0 0 / 0.62) 100%
 			),
-			radial-gradient(120% 80% at 50% 25%, transparent 45%, rgb(0 0 0 / 0.32) 100%);
+			radial-gradient(
+				120% 80% at 50% 25%,
+				transparent 45%,
+				rgb(0 0 0 / 0.32) 100%
+			);
 		overflow: hidden;
 	}
 	.np.closing {
@@ -1432,7 +1596,11 @@
 	.mesh-aura {
 		position: absolute;
 		inset: -15%;
-		background: radial-gradient(circle at 50% 30%, var(--glow, transparent) 0%, transparent 60%);
+		background: radial-gradient(
+			circle at 50% 30%,
+			var(--glow, transparent) 0%,
+			transparent 60%
+		);
 		opacity: 0.65;
 		animation: auraPulse 16s ease-in-out infinite alternate;
 		will-change: transform, opacity;
@@ -1577,7 +1745,12 @@
 		border-radius: 28px;
 		background: radial-gradient(
 			circle at 50% 50%,
-			color-mix(in srgb, var(--accent, var(--glow, transparent)) 50%, transparent) 0%,
+			color-mix(
+					in srgb,
+					var(--accent, var(--glow, transparent)) 50%,
+					transparent
+				)
+				0%,
 			transparent 75%
 		);
 		opacity: 0.9;
@@ -1947,7 +2120,11 @@
 		text-align: left;
 	}
 	.quality-options button.on {
-		background: color-mix(in srgb, var(--accent) 22%, rgb(255 255 255 / 0.06));
+		background: color-mix(
+			in srgb,
+			var(--accent) 22%,
+			rgb(255 255 255 / 0.06)
+		);
 		border-color: color-mix(in srgb, var(--accent) 55%, transparent);
 	}
 	.quality-options button:disabled {
@@ -2106,7 +2283,7 @@
 	/* ---- phones --------------------------------------------------------------- */
 	@media (max-width: 899px) {
 		.np {
-			border-radius: 28px 28px 0 0;
+			border-radius: 20px 20px 0 0;
 		}
 		.layout {
 			flex-direction: column;
@@ -2289,7 +2466,12 @@
 				#000 86%,
 				transparent 100%
 			);
-			mask-image: linear-gradient(to bottom, #000 0%, #000 86%, transparent 100%);
+			mask-image: linear-gradient(
+				to bottom,
+				#000 0%,
+				#000 86%,
+				transparent 100%
+			);
 		}
 		.tint {
 			background: none;

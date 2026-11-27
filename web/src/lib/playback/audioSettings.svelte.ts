@@ -126,6 +126,20 @@ class AudioSettings {
 		this.changed();
 	}
 
+	/** Cycles transition mode: Off → Crossfade → AutoMix → Off. */
+	cycleTransition() {
+		if (!this.crossfade) {
+			this.crossfade = true;
+			this.autoMix = false;
+		} else if (!this.autoMix) {
+			this.autoMix = true;
+		} else {
+			this.crossfade = false;
+			this.autoMix = false;
+		}
+		this.changed();
+	}
+
 	setSoundCheck(on: boolean) {
 		this.soundCheck = on;
 		this.changed();

@@ -56,12 +56,15 @@
 		sparkles:'M12 2.5l1.5 5.2L18.5 9l-5 1.5L12 16l-1.5-5.5L5.5 9l5-1.3L12 2.5zm7 10 1 3.5 3.5 1-3.5 1-1 3.5-1-3.5-3.5-1 3.5-1 1-3.5zM5 14l.7 2.3L8 17l-2.3.7L5 20l-.7-2.3L2 17l2.3-.7L5 14z',
 		info: 'M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8zm-1-5h2v-5h-2zm0-7h2V6h-2z',
 		waveform: 'M4 9h2v6H4zm5-4h2v14H9zm5 2h2v10h-2zm5 4h2v2h-2z',
+		// AutoMix: a sparkle above the crossfade S-curves (stroked part below).
+		autoMix: 'M12 2l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7.7-1.8z',
 	};
 
 	// Line glyphs, stroked rather than filled. A name in both maps draws both.
 	const strokes: Record<string, string> = {
 		// Two S-curves crossing: one song fading out as the next fades in.
 		crossfade: 'M4 18c8 0 8-12 16-12M4 6c8 0 8 12 16 12',
+		autoMix: 'M4 18c8 0 8-12 16-12M4 6c8 0 8 12 16 12',
 		queueShuffle: 'M13.8 3.5h1.4l3.6 5h2M13.8 8.5h1.4l3.6-5h2M19.8 2l1.5 1.5-1.5 1.5M19.8 7l1.5 1.5-1.5 1.5',
 		// The wand, with a gap for the band below its tip.
 		wand: 'M8.5 8.5l1.4 1.4M11.6 11.6l8.9 8.9',
