@@ -114,9 +114,9 @@
 		{
 			value: "HIGH",
 			label: "High",
-			detail: "AAC · same source, lighter on data",
+			detail: "AAC · Lossy",
 		},
-		{ value: "LOW", label: "Low", detail: "YouTube · least data" },
+		{ value: "LOW", label: "Low", detail: "OPUS/AAC · Lossy" },
 	];
 
 	getPlaybackQuality()
@@ -1955,12 +1955,12 @@
 		border: 0;
 		border-radius: 0;
 		background: none;
-		color: rgb(255 255 255 / 0.58);
-		font-size: 10.5px;
+		color: rgb(255 255 255 / 0.84);
+		font-size: 14px;
 		font-weight: 500;
 		letter-spacing: 0.01em;
 		transition: opacity 0.18s ease;
-		max-width: 200px;
+		max-width: 210px;
 		user-select: none;
 	}
 	.quality-badge:hover {
@@ -1979,13 +1979,13 @@
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		gap: 5px;
-		color: rgb(255 255 255 / 0.58);
-		font-size: 10.5px;
+		gap: 6px;
+		color: rgb(255 255 255 / 0.84);
+		font-size: 14px;
 		font-weight: 500;
 		letter-spacing: 0.01em;
 		text-transform: none;
-		max-width: 200px;
+		max-width: 210px;
 		user-select: none;
 	}
 	.fade-notice :global(svg) {
