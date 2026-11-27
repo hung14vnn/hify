@@ -1004,99 +1004,118 @@
 			>
 				<header class="specs-header">
 					<div class="specs-title-row">
-						<span class="specs-badge">{quality || "Audio"}</span>
-						<h3>Audio Technical Specs</h3>
+						<h3>Audio Quality</h3>
+						{#if quality}
+							<span class="specs-badge">{quality}</span>
+						{/if}
 					</div>
 					<button
 						class="specs-close"
 						onclick={() => (showAudioSpecs = false)}
 						aria-label="Close audio details"
 					>
-						<Icon name="close" size={16} />
+						<Icon name="close" size={14} />
 					</button>
 				</header>
 
-				<div class="quality-pick">
-					<span class="spec-label">Playback quality</span>
-					<div class="quality-options">
+				<section class="specs-section">
+					<span class="specs-section-title">Playback Quality</span>
+					<div class="specs-group quality-options">
 						{#each QUALITY_OPTIONS as option (option.value)}
 							<button
+								class="specs-row quality-option"
 								class:on={playbackQuality === option.value}
 								disabled={qualityBusy}
 								aria-pressed={playbackQuality === option.value}
 								onclick={() => chooseQuality(option.value)}
 							>
-								<span class="quality-label">{option.label}</span
-								>
-								<small>{option.detail}</small>
+								<span class="quality-copy">
+									<span class="quality-label"
+										>{option.label}</span
+									>
+									<small>{option.detail}</small>
+								</span>
+								{#if playbackQuality === option.value}
+									<span
+										class="quality-check"
+										aria-hidden="true"
+									>
+										<Icon name="check" size={16} />
+									</span>
+								{/if}
 							</button>
 						{/each}
 					</div>
-				</div>
+				</section>
 
-				<div class="specs-grid">
-					<div class="spec-card">
-						<span class="spec-label">Format / Codec</span>
-						<span class="spec-val highlight"
-							>{(song.suffix ?? "N/A").toUpperCase()}</span
-						>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Bitrate</span>
-						<span class="spec-val">
-							{song.bitRate
-								? `${song.bitRate} kbps`
-								: LOSSLESS.has(song.suffix?.toLowerCase() ?? "")
-									? "Lossless VBR"
-									: "Standard"}
-						</span>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Sample Rate</span>
-						<span class="spec-val">{sampleRateLabel}</span>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Bit Depth</span>
-						<span class="spec-val">{bitDepthLabel}</span>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Audio Engine</span>
-						<span class="spec-val"
-							>{player.webAudio
-								? "Web Audio DSP"
-								: "Native Audio"}</span
-						>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Sound Check</span>
-						<span class="spec-val">{replayGainLabel}</span>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Equalizer</span>
-						<span class="spec-val">
-							{audioSettings.eqEnabled
-								? audioSettings.preset
-								: audioSettings.enhancer
-									? "Sound Enhancer"
-									: "Flat"}
-						</span>
-					</div>
-					<div class="spec-card">
-						<span class="spec-label">Song Transitions</span>
-						<span class="spec-val"
-							>{player.webAudio && audioSettings.crossfade
-								? audioSettings.autoMix
-									? "AutoMix"
-									: "Crossfade"
-								: "Off"}</span
-						>
-					</div>
-				</div>
-
-				<div class="specs-footer">
-					<Icon name="waveform" size={15} />
-					<span>Destination: {outputLabel}</span>
-				</div>
+				<section class="specs-section">
+					<span class="specs-section-title">Technical Details</span>
+					<dl class="specs-group specs-list">
+						<div class="specs-row">
+							<dt>Format</dt>
+							<dd class="highlight">
+								{(song.suffix ?? "N/A").toUpperCase()}
+							</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Bitrate</dt>
+							<dd>
+								{song.bitRate
+									? `${song.bitRate} kbps`
+									: LOSSLESS.has(
+												song.suffix?.toLowerCase() ??
+													"",
+										  )
+										? "Lossless VBR"
+										: "Standard"}
+							</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Sample Rate</dt>
+							<dd>{sampleRateLabel}</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Bit Depth</dt>
+							<dd>{bitDepthLabel}</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Audio Engine</dt>
+							<dd>
+								{player.webAudio
+									? "Web Audio DSP"
+									: "Native Audio"}
+							</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Sound Check</dt>
+							<dd>{replayGainLabel}</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Equalizer</dt>
+							<dd>
+								{audioSettings.eqEnabled
+									? audioSettings.preset
+									: audioSettings.enhancer
+										? "Sound Enhancer"
+										: "Flat"}
+							</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Song Transitions</dt>
+							<dd>
+								{player.webAudio && audioSettings.crossfade
+									? audioSettings.autoMix
+										? "AutoMix"
+										: "Crossfade"
+									: "Off"}
+							</dd>
+						</div>
+						<div class="specs-row">
+							<dt>Output</dt>
+							<dd>{outputLabel}</dd>
+						</div>
+					</dl>
+				</section>
 			</div>
 		</div>
 	{/if}
@@ -1342,7 +1361,7 @@
 										class="quality-badge"
 										onclick={() => (showAudioSpecs = true)}
 										aria-label="Audio Quality: {qualityBadgeLabel} — click for technical details"
-										title="Audio Quality & Technical Details"
+										title="Stat for nerds"
 										in:fadeOnly={{ duration: 200 }}
 									>
 										<span class="badge-text"
@@ -1936,12 +1955,12 @@
 		border: 0;
 		border-radius: 0;
 		background: none;
-		color: rgb(255 255 255 / 0.84);
-		font-size: 14px;
+		color: rgb(255 255 255 / 0.58);
+		font-size: 10.5px;
 		font-weight: 500;
 		letter-spacing: 0.01em;
 		transition: opacity 0.18s ease;
-		max-width: 210px;
+		max-width: 200px;
 		user-select: none;
 	}
 	.quality-badge:hover {
@@ -1949,12 +1968,6 @@
 	}
 	.quality-badge:active {
 		opacity: 0.6;
-	}
-	.quality-icon {
-		width: 18px;
-		height: 10px;
-		flex-shrink: 0;
-		opacity: 0.9;
 	}
 	.badge-text {
 		white-space: nowrap;
@@ -2045,36 +2058,41 @@
 		color: #ffd60a;
 	}
 
-	/* ---- audio specs modal ---------------------------------------------------- */
+	/* ---- audio specs modal (Apple iOS inset-grouped sheet) ------------------- */
 	.specs-overlay {
 		position: absolute;
 		inset: 0;
 		z-index: 60;
-		background: rgb(0 0 0 / 0.45);
-		backdrop-filter: blur(8px);
-		-webkit-backdrop-filter: blur(8px);
+		background: rgb(0 0 0 / 0.6);
 		display: flex;
 		align-items: center;
 		justify-content: center;
-		padding: 20px;
+		padding: 16px;
 	}
 	.specs-sheet {
 		width: 100%;
 		max-width: 360px;
-		background: rgba(30, 30, 34, 0.9);
-		backdrop-filter: blur(28px);
-		-webkit-backdrop-filter: blur(28px);
-		border: 0.5px solid rgb(255 255 255 / 0.2);
-		border-radius: 20px;
-		padding: 20px;
-		box-shadow: 0 16px 40px rgb(0 0 0 / 0.5);
+		max-height: calc(100% - 16px);
+		overflow-y: auto;
+		background: rgb(28 28 30 / 0.96);
+		border: 0.5px solid rgb(255 255 255 / 0.16);
+		border-radius: 24px;
+		padding: 18px 16px 16px;
+		box-shadow:
+			0 24px 64px rgb(0 0 0 / 0.55),
+			inset 0 0.5px 0 rgb(255 255 255 / 0.14);
 		color: #fff;
+		scrollbar-width: none;
+	}
+	.specs-sheet::-webkit-scrollbar {
+		display: none;
 	}
 	.specs-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
 		margin-bottom: 16px;
+		padding: 0 2px;
 	}
 	.specs-title-row {
 		display: flex;
@@ -2083,110 +2101,127 @@
 	}
 	.specs-title-row h3 {
 		margin: 0;
-		font-size: 15px;
+		font-size: 17px;
 		font-weight: 700;
+		letter-spacing: -0.015em;
 	}
 	.specs-badge {
 		font-size: 10px;
-		font-weight: 700;
-		letter-spacing: 0.05em;
+		font-weight: 600;
+		letter-spacing: 0.03em;
 		text-transform: uppercase;
-		padding: 2px 6px;
-		border-radius: 4px;
-		background: #fff;
-		color: #000;
+		padding: 2px 7px;
+		border-radius: 999px;
+		background: rgb(255 255 255 / 0.14);
+		border: 0.5px solid rgb(255 255 255 / 0.18);
+		color: rgb(255 255 255 / 0.92);
 	}
 	.specs-close {
 		width: 28px;
 		height: 28px;
 		border-radius: 50%;
 		background: rgb(255 255 255 / 0.12);
-		color: rgb(255 255 255 / 0.8);
+		color: rgb(255 255 255 / 0.78);
 		display: flex;
 		align-items: center;
 		justify-content: center;
 		cursor: pointer;
+		transition:
+			background 0.15s ease,
+			color 0.15s ease;
 	}
 	.specs-close:hover {
 		background: rgb(255 255 255 / 0.22);
 		color: #fff;
 	}
-	.quality-pick {
-		margin-bottom: 14px;
+	.specs-section + .specs-section {
+		margin-top: 14px;
 	}
-	.quality-options {
-		display: grid;
-		gap: 6px;
-		margin-top: 6px;
-	}
-	.quality-options button {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 1px;
-		width: 100%;
-		padding: 9px 12px;
-		border-radius: 10px;
-		background: rgb(255 255 255 / 0.06);
-		border: 0.5px solid rgb(255 255 255 / 0.08);
-		color: #fff;
-		text-align: left;
-	}
-	.quality-options button.on {
-		background: color-mix(
-			in srgb,
-			var(--accent) 22%,
-			rgb(255 255 255 / 0.06)
-		);
-		border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-	}
-	.quality-options button:disabled {
-		opacity: 0.6;
-	}
-	.quality-label {
-		font-size: 14px;
-		font-weight: 500;
-	}
-	.quality-options small {
-		font-size: 12px;
-		color: rgb(255 255 255 / 0.55);
-	}
-	.specs-grid {
-		display: grid;
-		grid-template-columns: 1fr 1fr;
-		gap: 8px;
-		margin-bottom: 14px;
-	}
-	.spec-card {
-		background: rgb(255 255 255 / 0.06);
-		border: 0.5px solid rgb(255 255 255 / 0.08);
-		border-radius: 12px;
-		padding: 8px 10px;
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.spec-label {
-		font-size: 10.5px;
-		color: rgb(255 255 255 / 0.5);
-		font-weight: 500;
-	}
-	.spec-val {
-		font-size: 12.5px;
-		color: #fff;
+	.specs-section-title {
+		display: block;
+		padding: 0 12px 6px;
+		font-size: 11px;
 		font-weight: 600;
+		letter-spacing: 0.04em;
+		text-transform: uppercase;
+		color: rgb(255 255 255 / 0.48);
 	}
-	.spec-val.highlight {
-		color: color-mix(in srgb, var(--accent, #30d158) 75%, #fff 25%);
+	.specs-group {
+		margin: 0;
+		background: rgb(255 255 255 / 0.07);
+		border: 0.5px solid rgb(255 255 255 / 0.08);
+		border-radius: 14px;
+		overflow: hidden;
 	}
-	.specs-footer {
+	.specs-row {
+		position: relative;
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 9px 14px;
+		font-size: 13px;
+	}
+	.specs-row + .specs-row::before {
+		content: "";
+		position: absolute;
+		top: 0;
+		left: 14px;
+		right: 0;
+		height: 0.5px;
+		background: rgb(255 255 255 / 0.1);
+	}
+	.quality-option {
+		width: 100%;
+		color: #fff;
+		text-align: left;
+		transition: background 0.15s ease;
+	}
+	.quality-option:hover:not(:disabled) {
+		background: rgb(255 255 255 / 0.06);
+	}
+	.quality-option:disabled {
+		opacity: 0.55;
+	}
+	.quality-copy {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+		min-width: 0;
+	}
+	.quality-label {
+		font-size: 13.5px;
+		font-weight: 500;
+		color: #fff;
+	}
+	.quality-option small {
 		font-size: 11.5px;
-		color: rgb(255 255 255 / 0.65);
-		padding-top: 10px;
-		border-top: 0.5px solid rgb(255 255 255 / 0.1);
+		color: rgb(255 255 255 / 0.5);
+	}
+	.quality-check {
+		color: var(--accent, #fa2d48);
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+	}
+	.specs-list dt {
+		color: rgb(255 255 255 / 0.58);
+		font-weight: 400;
+		flex-shrink: 0;
+	}
+	.specs-list dd {
+		margin: 0;
+		color: #fff;
+		font-weight: 500;
+		text-align: right;
+		font-variant-numeric: tabular-nums;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.specs-list dd.highlight {
+		color: color-mix(in srgb, var(--accent, #30d158) 72%, #fff 28%);
+		font-weight: 600;
 	}
 
 	/* ---- transport ------------------------------------------------------------ */
